@@ -1,58 +1,55 @@
-package exporter
+// Copyright 2018 Google Inc. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package stackdriver
 
 import (
 	"fmt"
-	"time"
 
 	"go.opencensus.io/tag"
 	"google.golang.org/api/support/bundler"
 	metricpb "google.golang.org/genproto/googleapis/api/metric"
-	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
+	mpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
 
-// maximum number of time series that stackdriver accepts. Only test may change this value.
+// MaxTimeSeriePerUpload is the maximum number of time series that stackdriver accepts. Only test
+// may change this value.
 var MaxTimeSeriesPerUpload = 200
 
 // projectData contain per-project data in exporter. It should be created by newProjectData()
 type projectData struct {
-	parent    *StatsExporter
+	parent    *Exporter
 	projectID string
 	// We make bundler for each project because call to monitoring RPC can be grouped only in
 	// project level
-	bndler expBundler
+	bndler *bundler.Bundler
 }
 
-// We wrap bundler and its maker for testing purpose.
-type expBundler interface {
-	Add(interface{}, int) error
-	Flush()
-}
-
-var newExpBundler = defaultNewExpBundler
-
-// Since options in bundler are directly set to its fields and interface does not allow any fields,
-// we put option set-up process inside bundler's maker.
-func defaultNewExpBundler(uploader func(interface{}), delayThreshold time.Duration, countThreshold int) expBundler {
-	bndler := bundler.NewBundler((*RowData)(nil), uploader)
-
-	// Set options for bundler if they are provided by users.
-	if 0 < delayThreshold {
-		bndler.DelayThreshold = delayThreshold
-	}
-	if 0 < countThreshold {
-		bndler.BundleCountThreshold = countThreshold
-	}
-
-	return bndler
-}
-
-func (e *StatsExporter) newProjectData(projectID string) *projectData {
+func (e *Exporter) newProjectData(projectID string) *projectData {
 	pd := &projectData{
 		parent:    e,
 		projectID: projectID,
 	}
 
-	pd.bndler = newExpBundler(pd.uploadRowData, e.opts.BundleDelayThreshold, e.opts.BundleCountThreshold)
+	pd.bndler = newBundler((*RowData)(nil), pd.uploadRowData)
+	// Set options for bundler if they are provided by users.
+	if 0 < e.opts.BundleDelayThreshold {
+		pd.bndler.DelayThreshold = e.opts.BundleDelayThreshold
+	}
+	if 0 < e.opts.BundleCountThreshold {
+		pd.bndler.BundleCountThreshold = e.opts.BundleCountThreshold
+	}
 	return pd
 }
 
@@ -66,13 +63,13 @@ func (pd *projectData) uploadRowData(bundle interface{}) {
 	// remainingRds are RowData that has not been processed at all.
 	var reqRds, remainingRds []*RowData
 	for ; len(rds) != 0; rds = remainingRds {
-		var req *monitoringpb.CreateTimeSeriesRequest
+		var req *mpb.CreateTimeSeriesRequest
 		req, reqRds, remainingRds = pd.makeReq(rds)
 		if req == nil {
-			// no need to perform RPC call for empty set of requests.
+			// No need to perform RPC call for empty set of requests.
 			continue
 		}
-		if err := exp.client.CreateTimeSeries(exp.ctx, req); err != nil {
+		if err := createTimeSeries(exp.client, exp.ctx, req); err != nil {
 			newErr := fmt.Errorf("RPC call to create time series failed for project %s: %v", pd.projectID, err)
 			// We pass all row data not successfully uploaded.
 			exp.onError(newErr, reqRds...)
@@ -90,9 +87,9 @@ func (pd *projectData) uploadRowData(bundle interface{}) {
 //
 // Some rows in rds may fail while converting them to time series, and in that case makeReq() calls
 // exporter's onError() directly, not propagating errors to the caller.
-func (pd *projectData) makeReq(rds []*RowData) (req *monitoringpb.CreateTimeSeriesRequest, reqRds, remainingRds []*RowData) {
+func (pd *projectData) makeReq(rds []*RowData) (req *mpb.CreateTimeSeriesRequest, reqRds, remainingRds []*RowData) {
 	exp := pd.parent
-	timeSeries := []*monitoringpb.TimeSeries{}
+	timeSeries := []*mpb.TimeSeries{}
 
 	var i int
 	var rd *RowData
@@ -110,13 +107,13 @@ func (pd *projectData) makeReq(rds []*RowData) (req *monitoringpb.CreateTimeSeri
 			continue
 		}
 
-		ts := &monitoringpb.TimeSeries{
+		ts := &mpb.TimeSeries{
 			Metric: &metricpb.Metric{
 				Type:   rd.View.Name,
 				Labels: exp.makeLabels(rd.Row.Tags),
 			},
 			Resource: resource,
-			Points:   []*monitoringpb.Point{pt},
+			Points:   []*mpb.Point{pt},
 		}
 		// Growing timeseries and reqRds are done at same time.
 		timeSeries = append(timeSeries, ts)
@@ -132,7 +129,7 @@ func (pd *projectData) makeReq(rds []*RowData) (req *monitoringpb.CreateTimeSeri
 	if len(timeSeries) == 0 {
 		req = nil
 	} else {
-		req = &monitoringpb.CreateTimeSeriesRequest{
+		req = &mpb.CreateTimeSeriesRequest{
 			Name:       fmt.Sprintf("projects/%s", pd.projectID),
 			TimeSeries: timeSeries,
 		}
@@ -141,7 +138,7 @@ func (pd *projectData) makeReq(rds []*RowData) (req *monitoringpb.CreateTimeSeri
 }
 
 // makeLables constructs label that's ready for being uploaded to stackdriver.
-func (e *StatsExporter) makeLabels(tags []tag.Tag) map[string]string {
+func (e *Exporter) makeLabels(tags []tag.Tag) map[string]string {
 	opts := e.opts
 	labels := make(map[string]string, len(opts.DefaultLabels)+len(tags))
 	for key, val := range opts.DefaultLabels {
