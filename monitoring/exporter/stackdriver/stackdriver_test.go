@@ -76,7 +76,7 @@ func testProjectClassifyNoError(t *testing.T) {
 		}
 	}
 
-	exp := newTestExp(t, &Options{GetProjectID: getProjectID})
+	exp := newTestExp(t, Options{GetProjectID: getProjectID})
 	exp.ExportView(viewData1)
 	exp.ExportView(viewData2)
 
@@ -122,7 +122,7 @@ func testProjectClassifyError(t *testing.T) {
 		}
 	}
 
-	exp := newTestExp(t, &Options{GetProjectID: getProjectID})
+	exp := newTestExp(t, Options{GetProjectID: getProjectID})
 	exp.ExportView(viewData1)
 	exp.ExportView(viewData2)
 
@@ -171,7 +171,7 @@ func testDefaultProjectClassify(t *testing.T) {
 		Rows:  []*view.Row{view3row3},
 	}
 
-	exp := newTestExp(t, &Options{})
+	exp := newTestExp(t, Options{})
 	exp.ExportView(viewData1)
 	exp.ExportView(viewData2)
 	exp.ExportView(viewData3)
@@ -194,7 +194,7 @@ func testDefaultProjectClassify(t *testing.T) {
 // testUploadNoError tests that all RowData objects passed to uploadRowData() are grouped by
 // slice of length MaxTimeSeriesPerUpload, and passed to createTimeSeries().
 func testUploadNoError(t *testing.T) {
-	pd := newTestProjData(t, &Options{})
+	pd := newTestProjData(t, Options{})
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
 		{view1, startTime1, endTime1, view1row2},
@@ -220,7 +220,7 @@ func testUploadTimeSeriesMakeError(t *testing.T) {
 		}
 		return defaultMakeResource(rd)
 	}
-	pd := newTestProjData(t, &Options{MakeResource: makeResource})
+	pd := newTestProjData(t, Options{MakeResource: makeResource})
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
 		{view1, startTime1, endTime1, view1row2},
@@ -255,7 +255,7 @@ func testUploadTimeSeriesMakeError(t *testing.T) {
 // testUploadTimeSeriesMakeError tests that exporter can handle error on metric client's time
 // series create RPC call.
 func testUploadWithMetricClientError(t *testing.T) {
-	pd := newTestProjData(t, &Options{})
+	pd := newTestProjData(t, Options{})
 	timeSeriesResults = append(timeSeriesResults, invalidDataError)
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
@@ -298,7 +298,7 @@ func testMakeResource(t *testing.T) {
 			return nil, unrecognizedDataError
 		}
 	}
-	pd := newTestProjData(t, &Options{MakeResource: makeResource})
+	pd := newTestProjData(t, Options{MakeResource: makeResource})
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
 		{view1, startTime1, endTime1, view1row2},
@@ -318,7 +318,7 @@ func testMakeResource(t *testing.T) {
 // testMakeLabel tests that exporter can correctly handle label manipulation process, including
 // merging default label with tags, and removing unexported labels.
 func testMakeLabel(t *testing.T) {
-	opts := &Options{
+	opts := Options{
 		DefaultLabels: map[string]string{
 			label1name: value7,
 			label4name: value8,

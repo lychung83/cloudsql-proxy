@@ -127,7 +127,7 @@ func mockAddToBundler(bndler *bundler.Bundler, item interface{}, _ int) error {
 
 // newTestExp creates an exporter which saves error to errStorage. Caller should not set
 // opts.OnError.
-func newTestExp(t *testing.T, opts *Options) *Exporter {
+func newTestExp(t *testing.T, opts Options) *Exporter {
 	opts.OnError = testOnError
 	exp, err := NewExporter(ctx, opts)
 	if err != nil {
@@ -140,7 +140,7 @@ func newTestExp(t *testing.T, opts *Options) *Exporter {
 
 // newTestProjData creates a projectData object to test behavior of projectData.uploadRowData. Other
 // uses are not recommended. As newTestExp, all errors are saved to errStorage.
-func newTestProjData(t *testing.T, opts *Options) *projectData {
+func newTestProjData(t *testing.T, opts Options) *projectData {
 	return newTestExp(t, opts).newProjectData(project1)
 }
 

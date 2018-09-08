@@ -36,9 +36,12 @@ import (
 
 	monitoring "cloud.google.com/go/monitoring/apiv3"
 	"go.opencensus.io/stats/view"
+	"go.opencensus.io/tag"
 	"google.golang.org/api/option"
 	"google.golang.org/api/support/bundler"
+	metricpb "google.golang.org/genproto/googleapis/api/metric"
 	mrpb "google.golang.org/genproto/googleapis/api/monitoredres"
+	mpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
 
 // Exporter is the exporter that can be registered to opencensus. An Exporter object must be
@@ -47,12 +50,7 @@ type Exporter struct {
 	// TODO(lawrencechung): If possible, find a way to not storing ctx in the struct.
 	ctx    context.Context
 	client *monitoring.MetricClient
-	opts   *Options
-
-	// copy of some option values which may be modified by exporter.
-	getProjectID func(*RowData) (string, error)
-	onError      func(error, ...*RowData)
-	makeResource func(*RowData) (*mrpb.MonitoredResource, error)
+	opts   Options
 
 	// mu protects access to projDataMap
 	mu sync.Mutex
@@ -67,9 +65,14 @@ type Options struct {
 	// RPC calls.
 	ClientOptions []option.ClientOption
 
-	// options for bundles amortizing export requests. Note that a bundle is created for each
+	// Options for bundles amortizing export requests. Note that a bundle is created for each
 	// project. When not provided, default values in bundle package are used.
+
+	// BundleDelayThreshold determines the max amount of time the exporter can wait before
+	// uploading data to the stackdriver.
 	BundleDelayThreshold time.Duration
+	// BundleCountThreshold determines how many RowData objects can be buffered before batch
+	// uploading them to the backend.
 	BundleCountThreshold int
 
 	// Callback functions provided by user.
@@ -85,8 +88,8 @@ type Options struct {
 	GetProjectID func(*RowData) (projectID string, err error)
 	// OnError is used to report any error happened while exporting view data fails. Whenever
 	// this function is called, it's guaranteed that at least one row data is also passed to
-	// OnError. Row data passed to OnError must not be modified. When OnError is not set, all
-	// errors happened on exporting are ignored.
+	// OnError. Row data passed to OnError must not be modified and OnError must be
+	// non-blocking. When OnError is not set, all errors happened on exporting are ignored.
 	OnError func(error, ...*RowData)
 	// MakeResource creates monitored resource from RowData. It is guaranteed that only RowData
 	// that passes GetProjectID will be given to this function. Though not recommended, error
@@ -129,8 +132,8 @@ func defaultMakeResource(rd *RowData) (*mrpb.MonitoredResource, error) {
 	return &mrpb.MonitoredResource{Type: "global"}, nil
 }
 
-// Following functions are wrapper of functions that may show non-deterministic behavior. Only tests
-// can modify these functions.
+// Following functions are wrapper of functions those will be mocked by tests. Only tests can modify
+// these functions.
 var (
 	newMetricClient  = monitoring.NewMetricClient
 	createTimeSeries = (*monitoring.MetricClient).CreateTimeSeries
@@ -141,7 +144,7 @@ var (
 // NewExporter creates an Exporter object. Once a call to NewExporter is made, any fields in opts
 // must not be modified at all. ctx will also be used throughout entire exporter operation when
 // making RPC call.
-func NewExporter(ctx context.Context, opts *Options) (*Exporter, error) {
+func NewExporter(ctx context.Context, opts Options) (*Exporter, error) {
 	client, err := newMetricClient(ctx, opts.ClientOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create a metric client: %v", err)
@@ -154,19 +157,14 @@ func NewExporter(ctx context.Context, opts *Options) (*Exporter, error) {
 		projDataMap: make(map[string]*projectData),
 	}
 
-	// We don't want to modify user-supplied options, so save default options directly in
-	// exporter.
-	e.getProjectID = defaultGetProjectID
-	if opts.GetProjectID != nil {
-		e.getProjectID = opts.GetProjectID
+	if e.opts.GetProjectID == nil {
+		e.opts.GetProjectID = defaultGetProjectID
 	}
-	e.onError = defaultOnError
-	if opts.OnError != nil {
-		e.onError = opts.OnError
+	if e.opts.OnError == nil {
+		e.opts.OnError = defaultOnError
 	}
-	e.makeResource = defaultMakeResource
-	if opts.MakeResource != nil {
-		e.makeResource = opts.MakeResource
+	if e.opts.MakeResource == nil {
+		e.opts.MakeResource = defaultMakeResource
 	}
 
 	return e, nil
@@ -201,12 +199,12 @@ var RowDataNotApplicableError = errors.New("row data is not applicable to the ex
 
 // exportRowData exports a single row data.
 func (e *Exporter) exportRowData(rd *RowData) {
-	projID, err := e.getProjectID(rd)
+	projID, err := e.opts.GetProjectID(rd)
 	if err != nil {
 		// We ignore non-applicable RowData.
 		if err != RowDataNotApplicableError {
 			newErr := fmt.Errorf("failed to get project ID on row data with view %s: %v", rd.View.Name, err)
-			e.onError(newErr, rd)
+			e.opts.OnError(newErr, rd)
 		}
 		return
 	}
@@ -217,7 +215,7 @@ func (e *Exporter) exportRowData(rd *RowData) {
 		go pd.uploadRowData(rd)
 	default:
 		newErr := fmt.Errorf("failed to add row data with view %s to bundle for project %s: %v", rd.View.Name, projID, err)
-		e.onError(newErr, rd)
+		e.opts.OnError(newErr, rd)
 	}
 }
 
@@ -230,6 +228,23 @@ func (e *Exporter) getProjectData(projectID string) *projectData {
 
 	pd := e.newProjectData(projectID)
 	e.projDataMap[projectID] = pd
+	return pd
+}
+
+func (e *Exporter) newProjectData(projectID string) *projectData {
+	pd := &projectData{
+		parent:    e,
+		projectID: projectID,
+	}
+
+	pd.bndler = newBundler((*RowData)(nil), pd.uploadRowData)
+	// Set options for bundler if they are provided by users.
+	if 0 < e.opts.BundleDelayThreshold {
+		pd.bndler.DelayThreshold = e.opts.BundleDelayThreshold
+	}
+	if 0 < e.opts.BundleCountThreshold {
+		pd.bndler.BundleCountThreshold = e.opts.BundleCountThreshold
+	}
 	return pd
 }
 
@@ -247,4 +262,43 @@ func (e *Exporter) Close() error {
 		return fmt.Errorf("failed to close the metric client: %v", err)
 	}
 	return nil
+}
+
+// makeTS constructs a time series from a row data.
+func (e *Exporter) makeTS(rd *RowData) (*mpb.TimeSeries, error) {
+	pt := newPoint(rd.View, rd.Row, rd.Start, rd.End)
+	if pt.Value == nil {
+		return nil, fmt.Errorf("inconsistent data found in view %s", rd.View.Name)
+	}
+	resource, err := e.opts.MakeResource(rd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to construct resource of view %s: %v", rd.View.Name, err)
+	}
+	ts := &mpb.TimeSeries{
+		Metric: &metricpb.Metric{
+			Type:   rd.View.Name,
+			Labels: e.makeLabels(rd.Row.Tags),
+		},
+		Resource: resource,
+		Points:   []*mpb.Point{pt},
+	}
+	return ts, nil
+}
+
+// makeLables constructs label that's ready for being uploaded to stackdriver.
+func (e *Exporter) makeLabels(tags []tag.Tag) map[string]string {
+	opts := e.opts
+	labels := make(map[string]string, len(opts.DefaultLabels)+len(tags))
+	for key, val := range opts.DefaultLabels {
+		labels[key] = val
+	}
+	// If there's overlap When combining exporter's default label and tags, values in tags win.
+	for _, tag := range tags {
+		labels[tag.Key.Name()] = tag.Value
+	}
+	// Some labels are not for exporting.
+	for _, key := range opts.UnexportedLabels {
+		delete(labels, key)
+	}
+	return labels
 }
