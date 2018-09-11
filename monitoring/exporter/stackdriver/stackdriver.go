@@ -44,6 +44,10 @@ import (
 	mpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
 
+// MaxTimeSeriesPerUpload is the maximum number of timeseries objects that will be uploaded to
+// Stackdriver in one API call.
+const MaxTimeSeriesPerUpload = 100
+
 // Exporter is the exporter that can be registered to opencensus. An Exporter object must be
 // created by NewExporter().
 type Exporter struct {
@@ -62,17 +66,19 @@ type Exporter struct {
 // are valid for use.
 type Options struct {
 	// ClientOptions designates options for creating metric client, especially credentials for
-	// RPC calls.
+	// monitoring API calls.
 	ClientOptions []option.ClientOption
 
 	// Options for bundles amortizing export requests. Note that a bundle is created for each
-	// project. When not provided, default values in bundle package are used.
+	// project.
 
 	// BundleDelayThreshold determines the max amount of time the exporter can wait before
-	// uploading data to the stackdriver.
+	// uploading data to the stackdriver. If this value is not positive, the default value in
+	// the bundle package is used.
 	BundleDelayThreshold time.Duration
 	// BundleCountThreshold determines how many RowData objects can be buffered before batch
-	// uploading them to the backend.
+	// uploading them to the backend. If this value is not between 1 and MaxTimeSeriesPerUpload,
+	// MaxTimeSeriesPerUpload is used.
 	BundleCountThreshold int
 
 	// Callback functions provided by user.
@@ -143,7 +149,7 @@ var (
 
 // NewExporter creates an Exporter object. Once a call to NewExporter is made, any fields in opts
 // must not be modified at all. ctx will also be used throughout entire exporter operation when
-// making RPC call.
+// making monitoring API call.
 func NewExporter(ctx context.Context, opts Options) (*Exporter, error) {
 	client, err := newMetricClient(ctx, opts.ClientOptions...)
 	if err != nil {
@@ -157,6 +163,12 @@ func NewExporter(ctx context.Context, opts Options) (*Exporter, error) {
 		projDataMap: make(map[string]*projectData),
 	}
 
+	if !(0 < e.opts.BundleDelayThreshold) {
+		e.opts.BundleDelayThreshold = bundler.DefaultDelayThreshold
+	}
+	if !(0 < e.opts.BundleCountThreshold && e.opts.BundleCountThreshold <= MaxTimeSeriesPerUpload) {
+		e.opts.BundleCountThreshold = MaxTimeSeriesPerUpload
+	}
 	if e.opts.GetProjectID == nil {
 		e.opts.GetProjectID = defaultGetProjectID
 	}
@@ -238,13 +250,8 @@ func (e *Exporter) newProjectData(projectID string) *projectData {
 	}
 
 	pd.bndler = newBundler((*RowData)(nil), pd.uploadRowData)
-	// Set options for bundler if they are provided by users.
-	if 0 < e.opts.BundleDelayThreshold {
-		pd.bndler.DelayThreshold = e.opts.BundleDelayThreshold
-	}
-	if 0 < e.opts.BundleCountThreshold {
-		pd.bndler.BundleCountThreshold = e.opts.BundleCountThreshold
-	}
+	pd.bndler.DelayThreshold = e.opts.BundleDelayThreshold
+	pd.bndler.BundleCountThreshold = e.opts.BundleCountThreshold
 	return pd
 }
 

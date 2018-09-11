@@ -76,7 +76,10 @@ func testProjectClassifyNoError(t *testing.T) {
 		}
 	}
 
-	exp := newTestExp(t, Options{GetProjectID: getProjectID})
+	exp, err := newTestExp(Options{GetProjectID: getProjectID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	exp.ExportView(viewData1)
 	exp.ExportView(viewData2)
 
@@ -89,8 +92,12 @@ func testProjectClassifyNoError(t *testing.T) {
 			{view1, startTime1, endTime1, view1row2},
 		},
 	}
-	checkErrStorage(t, nil)
-	checkProjData(t, wantRowData)
+	if err := checkErrStorage(nil); err != nil {
+		t.Error(err)
+	}
+	if err := checkProjData(wantRowData); err != nil {
+		t.Error(err)
+	}
 }
 
 // testProjectClassifyError tests that exporter can properly handle errors while classifying
@@ -122,7 +129,10 @@ func testProjectClassifyError(t *testing.T) {
 		}
 	}
 
-	exp := newTestExp(t, Options{GetProjectID: getProjectID})
+	exp, err := newTestExp(Options{GetProjectID: getProjectID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	exp.ExportView(viewData1)
 	exp.ExportView(viewData2)
 
@@ -139,8 +149,12 @@ func testProjectClassifyError(t *testing.T) {
 			{view2, startTime2, endTime2, view2row2},
 		},
 	}
-	checkErrStorage(t, wantErrRdCheck)
-	checkProjData(t, wantRowData)
+	if err := checkErrStorage(wantErrRdCheck); err != nil {
+		t.Error(err)
+	}
+	if err := checkProjData(wantRowData); err != nil {
+		t.Error(err)
+	}
 }
 
 // testDefaultProjectClassify tests that defaultGetProjectID classifies RowData by tag with key name
@@ -171,13 +185,18 @@ func testDefaultProjectClassify(t *testing.T) {
 		Rows:  []*view.Row{view3row3},
 	}
 
-	exp := newTestExp(t, Options{})
+	exp, err := newTestExp(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	exp.ExportView(viewData1)
 	exp.ExportView(viewData2)
 	exp.ExportView(viewData3)
 	exp.ExportView(viewData4)
 
-	checkErrStorage(t, nil)
+	if err := checkErrStorage(nil); err != nil {
+		t.Error(err)
+	}
 	// RowData in viewData1 and viewData3 has no project ID tag, so ignored.
 	wantRowData := map[string][]*RowData{
 		project1: []*RowData{
@@ -188,13 +207,18 @@ func testDefaultProjectClassify(t *testing.T) {
 			{view3, startTime2, endTime2, view3row2},
 		},
 	}
-	checkProjData(t, wantRowData)
+	if err := checkProjData(wantRowData); err != nil {
+		t.Error(err)
+	}
 }
 
 // testUploadNoError tests that all RowData objects passed to uploadRowData() are grouped by
 // slice of length MaxTimeSeriesPerUpload, and passed to createTimeSeries().
 func testUploadNoError(t *testing.T) {
-	pd := newTestProjData(t, Options{})
+	pd, err := newTestProjData(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
 		{view1, startTime1, endTime1, view1row2},
@@ -204,12 +228,16 @@ func testUploadNoError(t *testing.T) {
 	}
 	pd.uploadRowData(rd)
 
-	checkErrStorage(t, nil)
+	if err := checkErrStorage(nil); err != nil {
+		t.Error(err)
+	}
 	wantClData := [][]int64{
 		{1, 2, 3},
 		{4, 5},
 	}
-	checkMetricClient(t, wantClData)
+	if err := checkMetricClient(wantClData); err != nil {
+		t.Error(err)
+	}
 }
 
 // testUploadTimeSeriesMakeError tests that errors while creating time series are properly handled.
@@ -220,7 +248,10 @@ func testUploadTimeSeriesMakeError(t *testing.T) {
 		}
 		return defaultMakeResource(rd)
 	}
-	pd := newTestProjData(t, Options{MakeResource: makeResource})
+	pd, err := newTestProjData(Options{MakeResource: makeResource})
+	if err != nil {
+		t.Fatal(err)
+	}
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
 		{view1, startTime1, endTime1, view1row2},
@@ -243,19 +274,26 @@ func testUploadTimeSeriesMakeError(t *testing.T) {
 			rds:       []*RowData{{view2, startTime2, endTime2, invalidRow}},
 		},
 	}
-	checkErrStorage(t, wantErrRdCheck)
+	if err := checkErrStorage(wantErrRdCheck); err != nil {
+		t.Error(err)
+	}
 
 	wantClData := [][]int64{
 		{1, 3, 4},
 		{5},
 	}
-	checkMetricClient(t, wantClData)
+	if err := checkMetricClient(wantClData); err != nil {
+		t.Error(err)
+	}
 }
 
 // testUploadTimeSeriesMakeError tests that exporter can handle error on metric client's time
-// series create RPC call.
+// series create monitoing API call.
 func testUploadWithMetricClientError(t *testing.T) {
-	pd := newTestProjData(t, Options{})
+	pd, err := newTestProjData(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	timeSeriesResults = append(timeSeriesResults, invalidDataError)
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
@@ -268,7 +306,7 @@ func testUploadWithMetricClientError(t *testing.T) {
 
 	wantErrRdCheck := []errRowDataCheck{
 		{
-			errPrefix: "RPC call to create time series failed",
+			errPrefix: "monitoring API call to create time series failed",
 			errSuffix: invalidDataErrStr,
 			rds: []*RowData{
 				{view1, startTime1, endTime1, view1row1},
@@ -277,13 +315,17 @@ func testUploadWithMetricClientError(t *testing.T) {
 			},
 		},
 	}
-	checkErrStorage(t, wantErrRdCheck)
+	if err := checkErrStorage(wantErrRdCheck); err != nil {
+		t.Error(err)
+	}
 
 	wantClData := [][]int64{
 		{1, 2, 3},
 		{4, 5},
 	}
-	checkMetricClient(t, wantClData)
+	if err := checkMetricClient(wantClData); err != nil {
+		t.Error(err)
+	}
 }
 
 // testMakeResource tests that exporter can create monitored resource dynamically.
@@ -298,14 +340,21 @@ func testMakeResource(t *testing.T) {
 			return nil, unrecognizedDataError
 		}
 	}
-	pd := newTestProjData(t, Options{MakeResource: makeResource})
+	pd, err := newTestProjData(Options{MakeResource: makeResource})
+	if err != nil {
+		t.Fatal(err)
+	}
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
 		{view1, startTime1, endTime1, view1row2},
 	}
 	pd.uploadRowData(rd)
-	checkErrStorage(t, nil)
-	checkMetricClient(t, [][]int64{{1, 2}})
+	if err := checkErrStorage(nil); err != nil {
+		t.Error(err)
+	}
+	if err := checkMetricClient([][]int64{{1, 2}}); err != nil {
+		t.Error(err)
+	}
 
 	tsArr := timeSeriesReqs[0].TimeSeries
 	for i, wantResource := range []*mrpb.MonitoredResource{resource1, resource2} {
@@ -325,14 +374,21 @@ func testMakeLabel(t *testing.T) {
 		},
 		UnexportedLabels: []string{label3name, label5name},
 	}
-	pd := newTestProjData(t, opts)
+	pd, err := newTestProjData(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
 		{view2, startTime2, endTime2, view2row1},
 	}
 	pd.uploadRowData(rd)
-	checkErrStorage(t, nil)
-	checkMetricClient(t, [][]int64{{1, 4}})
+	if err := checkErrStorage(nil); err != nil {
+		t.Error(err)
+	}
+	if err := checkMetricClient([][]int64{{1, 4}}); err != nil {
+		t.Error(err)
+	}
 
 	wantLabels1 := map[string]string{
 		label1name: value7,
@@ -348,6 +404,8 @@ func testMakeLabel(t *testing.T) {
 	tsArr := timeSeriesReqs[0].TimeSeries
 	for i, wantLabels := range []map[string]string{wantLabels1, wantLabels2} {
 		prefix := fmt.Sprintf("%d-th time series labels mismatch", i+1)
-		checkLabels(t, prefix, tsArr[i].Metric.Labels, wantLabels)
+		if err := checkLabels(prefix, tsArr[i].Metric.Labels, wantLabels); err != nil {
+			t.Error(err)
+		}
 	}
 }

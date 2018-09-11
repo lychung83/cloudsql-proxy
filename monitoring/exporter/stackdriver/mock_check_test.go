@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"testing"
 
 	monitoring "cloud.google.com/go/monitoring/apiv3"
 	gax "github.com/googleapis/gax-go"
@@ -50,9 +49,6 @@ var (
 )
 
 func init() {
-	// For testing convenience, we reduce maximum time series that metric client accepts.
-	MaxTimeSeriesPerUpload = 3
-
 	// Mock functions.
 	newMetricClient = mockNewMetricClient
 	createTimeSeries = mockCreateTimeSeries
@@ -126,22 +122,29 @@ func mockAddToBundler(bndler *bundler.Bundler, item interface{}, _ int) error {
 // One of these functions once and only once, and never call NewExporter() directly.
 
 // newTestExp creates an exporter which saves error to errStorage. Caller should not set
-// opts.OnError.
-func newTestExp(t *testing.T, opts Options) *Exporter {
+// opts.OnError and opts.BundleCountThreshold.
+func newTestExp(opts Options) (*Exporter, error) {
 	opts.OnError = testOnError
+	// For testing convenience, we reduce the number of timeseris in one upload monitoring API
+	// call.
+	opts.BundleCountThreshold = 3
 	exp, err := NewExporter(ctx, opts)
 	if err != nil {
-		t.Fatalf("creating exporter failed: %v", err)
+		return nil, fmt.Errorf("creating exporter failed: %v", err)
 	}
 	// Expose projDataMap so that mockAddToBundler() can use it.
 	projDataMap = exp.projDataMap
-	return exp
+	return exp, nil
 }
 
 // newTestProjData creates a projectData object to test behavior of projectData.uploadRowData. Other
 // uses are not recommended. As newTestExp, all errors are saved to errStorage.
-func newTestProjData(t *testing.T, opts Options) *projectData {
-	return newTestExp(t, opts).newProjectData(project1)
+func newTestProjData(opts Options) (*projectData, error) {
+	exp, err := newTestExp(opts)
+	if err != nil {
+		return nil, err
+	}
+	return exp.newProjectData(project1), nil
 }
 
 // We define a storage for all errors happened in export operation.
@@ -157,22 +160,42 @@ func testOnError(err error, rds ...*RowData) {
 	errStorage = append(errStorage, errRowData{err, rds})
 }
 
+// multiError stores a sequence of errors. To convert it to an actual error, call toError().
+type multiError struct {
+	errs []error
+}
+
+func (me *multiError) addf(format string, args ...interface{}) {
+	me.errs = append(me.errs, fmt.Errorf(format, args...))
+}
+
+func (me *multiError) toError() error {
+	switch len(me.errs) {
+	case 0:
+		return nil
+	case 1:
+		return me.errs[0]
+	default:
+		return fmt.Errorf("multiple errors: %q", me.errs)
+	}
+}
+
 // checkMetricClient checks all recorded requests to the metric client. We only compare int64
 // values of the time series. To make this work, we assigned different int64 values for all valid
 // rows in the test.
-func checkMetricClient(t *testing.T, wantReqsValues [][]int64) {
+func checkMetricClient(wantReqsValues [][]int64) error {
 	reqsLen, wantReqsLen := len(timeSeriesReqs), len(wantReqsValues)
 	if reqsLen != wantReqsLen {
-		t.Errorf("number of requests got: %d, want %d", reqsLen, wantReqsLen)
-		return
+		return fmt.Errorf("number of requests got: %d, want %d", reqsLen, wantReqsLen)
 	}
+	var errs multiError
 	for i := 0; i < reqsLen; i++ {
 		prefix := fmt.Sprintf("%d-th request mismatch", i+1)
 		tsArr := timeSeriesReqs[i].TimeSeries
 		wantTsValues := wantReqsValues[i]
 		tsArrLen, wantTsArrLen := len(tsArr), len(wantTsValues)
 		if tsArrLen != wantTsArrLen {
-			t.Errorf("%s: number of time series got: %d, want: %d", prefix, tsArrLen, wantTsArrLen)
+			errs.addf("%s: number of time series got: %d, want: %d", prefix, tsArrLen, wantTsArrLen)
 			continue
 		}
 		for j := 0; j < tsArrLen; j++ {
@@ -180,10 +203,11 @@ func checkMetricClient(t *testing.T, wantReqsValues [][]int64) {
 			tsVal := tsArr[j].Points[0].Value.Value.(*mpb.TypedValue_Int64Value).Int64Value
 			wantTsVal := wantTsValues[j]
 			if tsVal != wantTsVal {
-				t.Errorf("%s: Value got: %d, want: %d", prefix, tsVal, wantTsVal)
+				errs.addf("%s: Value got: %d, want: %d", prefix, tsVal, wantTsVal)
 			}
 		}
 	}
+	return errs.toError()
 }
 
 // errRowDataCheck contains data for checking content of error storage.
@@ -193,26 +217,27 @@ type errRowDataCheck struct {
 }
 
 // checkErrStorage checks content of error storage. For returned errors, we check prefix and suffix.
-func checkErrStorage(t *testing.T, wantErrRdCheck []errRowDataCheck) {
+func checkErrStorage(wantErrRdCheck []errRowDataCheck) error {
 	gotLen, wantLen := len(errStorage), len(wantErrRdCheck)
 	if gotLen != wantLen {
-		t.Errorf("number of reported errors: %d, want: %d", gotLen, wantLen)
-		return
+		return fmt.Errorf("number of reported errors: %d, want: %d", gotLen, wantLen)
 	}
+	var errs multiError
 	for i := 0; i < gotLen; i++ {
 		prefix := fmt.Sprintf("%d-th reported error mismatch", i+1)
 		errRd, wantErrRd := errStorage[i], wantErrRdCheck[i]
 		errStr := errRd.err.Error()
 		if errPrefix := wantErrRd.errPrefix; !strings.HasPrefix(errStr, errPrefix) {
-			t.Errorf("%s: error got: %q, want: prefixed by %q", prefix, errStr, errPrefix)
+			errs.addf("%s: error got: %q, want: prefixed by %q", prefix, errStr, errPrefix)
 		}
 		if errSuffix := wantErrRd.errSuffix; !strings.HasSuffix(errStr, errSuffix) {
-			t.Errorf("%s: error got: %q, want: suffiexd by %q", prefix, errStr, errSuffix)
+			errs.addf("%s: error got: %q, want: suffiexd by %q", prefix, errStr, errSuffix)
 		}
 		if err := checkRowDataArr(errRd.rds, wantErrRd.rds); err != nil {
-			t.Errorf("%s: RowData array mismatch: %v", prefix, err)
+			errs.addf("%s: RowData array mismatch: %v", prefix, err)
 		}
 	}
+	return errs.toError()
 }
 
 func checkRowDataArr(rds, wantRds []*RowData) error {
@@ -220,69 +245,71 @@ func checkRowDataArr(rds, wantRds []*RowData) error {
 	if rdLen != wantRdLen {
 		return fmt.Errorf("number row data got: %d, want: %d", rdLen, wantRdLen)
 	}
+	var errs multiError
 	for i := 0; i < rdLen; i++ {
 		if err := checkRowData(rds[i], wantRds[i]); err != nil {
-			return fmt.Errorf("%d-th row data mismatch: %v", i+1, err)
+			errs.addf("%d-th row data mismatch: %v", i+1, err)
 		}
 	}
-	return nil
+	return errs.toError()
 }
 
 func checkRowData(rd, wantRd *RowData) error {
+	var errs multiError
 	if rd.View != wantRd.View {
-		return fmt.Errorf("View got: %s, want: %s", rd.View.Name, wantRd.View.Name)
+		errs.addf("View got: %s, want: %s", rd.View.Name, wantRd.View.Name)
 	}
 	if rd.Start != wantRd.Start {
-		return fmt.Errorf("Start got: %v, want: %v", rd.Start, wantRd.Start)
+		errs.addf("Start got: %v, want: %v", rd.Start, wantRd.Start)
 	}
 	if rd.End != wantRd.End {
-		return fmt.Errorf("End got: %v, want: %v", rd.End, wantRd.End)
+		errs.addf("End got: %v, want: %v", rd.End, wantRd.End)
 	}
 	if rd.Row != wantRd.Row {
-		return fmt.Errorf("Row got: %v, want: %v", rd.Row, wantRd.Row)
+		errs.addf("Row got: %v, want: %v", rd.Row, wantRd.Row)
 	}
-	return nil
+	return errs.toError()
 }
 
 // checkProjData checks all data passed to the bundler by bundler.Add().
-func checkProjData(t *testing.T, wantProjData map[string][]*RowData) {
-	wantProj := map[string]bool{}
-	for proj := range wantProjData {
-		wantProj[proj] = true
-	}
+func checkProjData(wantProjData map[string][]*RowData) error {
+	var errs multiError
 	for proj := range projRds {
-		if !wantProj[proj] {
-			t.Errorf("project in exporter's project data not wanted: %s", proj)
+		if _, ok := wantProjData[proj]; !ok {
+			errs.addf("project in exporter's project data not wanted: %s", proj)
 		}
 	}
 
 	for proj, wantRds := range wantProjData {
 		rds, ok := projRds[proj]
 		if !ok {
-			t.Errorf("wanted project not found in exporter's project data: %v", proj)
+			errs.addf("wanted project not found in exporter's project data: %v", proj)
 			continue
 		}
 		if err := checkRowDataArr(*rds, wantRds); err != nil {
-			t.Errorf("RowData array mismatch for project %s: %v", proj, err)
+			errs.addf("RowData array mismatch for project %s: %v", proj, err)
 		}
 	}
+	return errs.toError()
 }
 
 // checkLabels checks data in labels.
-func checkLabels(t *testing.T, prefix string, labels, wantLabels map[string]string) {
+func checkLabels(prefix string, labels, wantLabels map[string]string) error {
+	var errs multiError
 	for labelName, value := range labels {
 		wantValue, ok := wantLabels[labelName]
 		if !ok {
-			t.Errorf("%s: label name in time series not wanted: %s", prefix, labelName)
+			errs.addf("%s: label name in time series not wanted: %s", prefix, labelName)
 			continue
 		}
 		if value != wantValue {
-			t.Errorf("%s: value for label name %s got: %s, want: %s", prefix, labelName, value, wantValue)
+			errs.addf("%s: value for label name %s got: %s, want: %s", prefix, labelName, value, wantValue)
 		}
 	}
 	for wantLabelName := range wantLabels {
 		if _, ok := labels[wantLabelName]; !ok {
-			t.Errorf("%s: wanted label name not found in time series: %s", prefix, wantLabelName)
+			errs.addf("%s: wanted label name not found in time series: %s", prefix, wantLabelName)
 		}
 	}
+	return errs.toError()
 }

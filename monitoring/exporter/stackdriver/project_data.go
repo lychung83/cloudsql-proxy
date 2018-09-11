@@ -21,16 +21,11 @@ import (
 	mpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
 
-// MaxTimeSeriePerUpload is the maximum number of time series that's uploaded to the stackdriver
-// at once. Consumer may change this value, but note that stackdriver may reject upload request if
-// the number of time series is too large.
-var MaxTimeSeriesPerUpload = 100
-
 // projectData contain per-project data in exporter. It should be created by newProjectData()
 type projectData struct {
 	parent    *Exporter
 	projectID string
-	// We make bundler for each project because call to monitoring RPC can be grouped only in
+	// We make bundler for each project because call to monitoring API can be grouped only in
 	// project level
 	bndler *bundler.Bundler
 }
@@ -55,7 +50,7 @@ func (pd *projectData) uploadRowData(bundle interface{}) {
 		// Time series created. We update both uploadTs and uploadRds.
 		uploadTs = append(uploadTs, ts)
 		uploadRds = append(uploadRds, rd)
-		if len(uploadTs) == MaxTimeSeriesPerUpload {
+		if len(uploadTs) == exp.opts.BundleCountThreshold {
 			pd.uploadTimeSeries(uploadTs, uploadRds)
 			uploadTs = nil
 			uploadRds = nil
@@ -77,7 +72,7 @@ func (pd *projectData) uploadTimeSeries(ts []*mpb.TimeSeries, rds []*RowData) {
 		TimeSeries: ts,
 	}
 	if err := createTimeSeries(exp.client, exp.ctx, req); err != nil {
-		newErr := fmt.Errorf("RPC call to create time series failed for project %s: %v", pd.projectID, err)
+		newErr := fmt.Errorf("monitoring API call to create time series failed for project %s: %v", pd.projectID, err)
 		// We pass all row data not successfully uploaded.
 		exp.opts.OnError(newErr, rds...)
 	}

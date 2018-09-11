@@ -25,7 +25,7 @@ import (
 )
 
 // Functions in this file is used to convert RowData to monitoring point that are used by uploading
-// RPC calls of monitoring client. All functions in this file are copied from
+// monitoring API calls. All functions in this file are copied from
 // contrib.go.opencensus.io/exporter/stackdriver.
 
 func newPoint(v *view.View, row *view.Row, start, end time.Time) *mpb.Point {
