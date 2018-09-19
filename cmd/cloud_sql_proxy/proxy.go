@@ -45,7 +45,7 @@ func WatchInstances(dir string, cfgs []instanceConfig, updates <-chan string, cl
 	// Instances specified statically (e.g. as flags to the binary) will always
 	// be available. They are ignored if also returned by the GCE metadata since
 	// the socket will already be open.
-	staticInstances := make(map[string]net.Listener, len(cfgs))
+	staticInstances := make(map[util.Instance]net.Listener, len(cfgs))
 	for _, v := range cfgs {
 		l, err := listenInstance(ch, v)
 		if err != nil {
@@ -60,15 +60,15 @@ func WatchInstances(dir string, cfgs []instanceConfig, updates <-chan string, cl
 	return ch, nil
 }
 
-func watchInstancesLoop(dir string, dst chan<- proxy.Conn, updates <-chan string, static map[string]net.Listener, cl *http.Client) {
-	dynamicInstances := make(map[string]net.Listener)
+func watchInstancesLoop(dir string, dst chan<- proxy.Conn, updates <-chan string, static map[util.Instance]net.Listener, cl *http.Client) {
+	dynamicInstances := make(map[util.Instance]net.Listener)
 	for instances := range updates {
 		list, err := parseInstanceConfigs(dir, strings.Split(instances, ","), cl)
 		if err != nil {
 			logging.Errorf("%v", err)
 		}
 
-		stillOpen := make(map[string]net.Listener)
+		stillOpen := make(map[util.Instance]net.Listener)
 		for _, cfg := range list {
 			instance := cfg.Instance
 
@@ -171,7 +171,7 @@ func listenInstance(dst chan<- proxy.Conn, cfg instanceConfig) (net.Listener, er
 }
 
 type instanceConfig struct {
-	Instance         string
+	util.Instance
 	Network, Address string
 }
 
@@ -219,23 +219,26 @@ var validNets = func() map[string]bool {
 	return m
 }()
 
-func parseInstanceConfig(dir, instance string, cl *http.Client) (instanceConfig, error) {
+func parseInstanceConfig(dir, instanceName string, cl *http.Client) (instanceConfig, error) {
 	var ret instanceConfig
-	eq := strings.Index(instance, "=")
+	eq := strings.Index(instanceName, "=")
 	if eq != -1 {
-		spl := strings.SplitN(instance[eq+1:], ":", 3)
-		ret.Instance = instance[:eq]
+		instance, err := util.NewInstance(instanceName[:eq])
+		if err != nil {
+			return instanceConfig{}, err
+		}
+		ret.Instance = instance
 
-		switch len(spl) {
+		switch spl := strings.SplitN(instanceName[eq+1:], ":", 3); len(spl) {
 		default:
-			return ret, fmt.Errorf("invalid %q: expected 'project:instance=tcp:port'", instance)
+			return ret, fmt.Errorf("invalid %q: expected 'project:region:instance=tcp:port'", instanceName)
 		case 2:
 			// No "host" part of the address. Be safe and assume that they want a
 			// loopback address.
 			ret.Network = spl[0]
 			addr, ok := loopbackForNet[spl[0]]
 			if !ok {
-				return ret, fmt.Errorf("invalid %q: unrecognized network %v", instance, spl[0])
+				return ret, fmt.Errorf("invalid %q: unrecognized network %v", instanceName, spl[0])
 			}
 			ret.Address = fmt.Sprintf("%s:%s", addr, spl[1])
 		case 3:
@@ -249,34 +252,34 @@ func parseInstanceConfig(dir, instance string, cl *http.Client) (instanceConfig,
 			return instanceConfig{}, err
 		}
 		sql.BasePath = *host
+		instance, err := util.NewInstance(instanceName)
+		if err != nil {
+			return instanceConfig{}, err
+		}
 		ret.Instance = instance
 		// Default to unix socket.
 		ret.Network = "unix"
 
-		proj, _, name := util.SplitName(instance)
-		if proj == "" || name == "" {
-			return instanceConfig{}, fmt.Errorf("invalid instance name: must be in the form `project:region:instance-name`; invalid name was %q", instance)
-		}
 		// We allow people to omit the region due to historical reasons. It'll
 		// fail later in the code if this isn't allowed, so just assume it's
 		// allowed until we actually need the region in this API call.
-		in, err := sql.Instances.Get(proj, name).Do()
+		in, err := sql.Instances.Get(instance.Project, instance.Database).Do()
 		if err != nil {
 			return instanceConfig{}, err
 		}
 		if strings.HasPrefix(strings.ToLower(in.DatabaseVersion), "postgres") {
-			path := filepath.Join(dir, instance)
+			path := filepath.Join(dir, instanceName)
 			if err := os.MkdirAll(path, 0755); err != nil {
 				return instanceConfig{}, err
 			}
 			ret.Address = filepath.Join(path, ".s.PGSQL.5432")
 		} else {
-			ret.Address = filepath.Join(dir, instance)
+			ret.Address = filepath.Join(dir, instanceName)
 		}
 	}
 
 	if !validNets[ret.Network] {
-		return ret, fmt.Errorf("invalid %q: unsupported network: %v", instance, ret.Network)
+		return ret, fmt.Errorf("invalid %q: unsupported network: %v", instanceName, ret.Network)
 	}
 	return ret, nil
 }

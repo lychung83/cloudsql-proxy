@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
 )
 
 const (
@@ -39,17 +40,17 @@ var errNotCached = errors.New("instance was not found in cache")
 
 // Conn represents a connection from a client to a specific instance.
 type Conn struct {
-	Instance string
-	Conn     net.Conn
+	util.Instance
+	Conn net.Conn
 }
 
 // CertSource is how a Client obtains various certificates required for operation.
 type CertSource interface {
 	// Local returns a certificate that can be used to authenticate with the
 	// provided instance.
-	Local(instance string) (tls.Certificate, error)
+	Local(instance util.Instance) (tls.Certificate, error)
 	// Remote returns the instance's CA certificate, address, and name.
-	Remote(instance string) (cert *x509.Certificate, addr, name string, err error)
+	Remote(instance util.Instance) (cert *x509.Certificate, addr, name string, err error)
 }
 
 // Client is a type to handle connecting to a Server. All fields are required
@@ -79,7 +80,7 @@ type Client struct {
 	// The cfgCache holds the most recent connection configuration keyed by
 	// instance. Relevant functions are refreshCfg and cachedCfg. It is
 	// protected by cfgL.
-	cfgCache map[string]cacheEntry
+	cfgCache map[util.Instance]cacheEntry
 	cfgL     sync.RWMutex
 
 	// MaxConnections is the maximum number of connections to establish
@@ -138,10 +139,11 @@ func (c *Client) handleConn(conn Conn) {
 		conn.Conn = dbgConn{conn.Conn}
 	}
 
-	c.Conns.Add(conn.Instance, conn.Conn)
-	copyThenClose(server, conn.Conn, conn.Instance, "local connection on "+conn.Conn.LocalAddr().String())
+	instName := conn.Instance.String()
+	c.Conns.Add(instName, conn.Conn)
+	copyThenClose(server, conn.Conn, instName, "local connection on "+conn.Conn.LocalAddr().String())
 
-	if err := c.Conns.Remove(conn.Instance, conn.Conn); err != nil {
+	if err := c.Conns.Remove(instName, conn.Conn); err != nil {
 		logging.Errorf("%s", err)
 	}
 }
@@ -149,7 +151,7 @@ func (c *Client) handleConn(conn Conn) {
 // refreshCfg uses the CertSource inside the Client to find the instance's
 // address as well as construct a new tls.Config to connect to the instance. It
 // caches the result.
-func (c *Client) refreshCfg(instance string) (addr string, cfg *tls.Config, err error) {
+func (c *Client) refreshCfg(instance util.Instance) (addr string, cfg *tls.Config, err error) {
 	c.cfgL.Lock()
 	defer c.cfgL.Unlock()
 
@@ -159,13 +161,13 @@ func (c *Client) refreshCfg(instance string) (addr string, cfg *tls.Config, err 
 	}
 
 	if old := c.cfgCache[instance]; time.Since(old.lastRefreshed) < throttle {
-		logging.Errorf("Throttling refreshCfg(%s): it was only called %v ago", instance, time.Since(old.lastRefreshed))
+		logging.Errorf("Throttling refreshCfg(%v): it was only called %v ago", instance, time.Since(old.lastRefreshed))
 		// Refresh was called too recently, just reuse the result.
 		return old.addr, old.cfg, old.err
 	}
 
 	if c.cfgCache == nil {
-		c.cfgCache = make(map[string]cacheEntry)
+		c.cfgCache = make(map[util.Instance]cacheEntry)
 	}
 
 	defer func() {
@@ -233,7 +235,7 @@ func genVerifyPeerCertificateFunc(instanceName string, pool *x509.CertPool) func
 	}
 }
 
-func (c *Client) cachedCfg(instance string) (string, *tls.Config) {
+func (c *Client) cachedCfg(instance util.Instance) (string, *tls.Config) {
 	c.cfgL.RLock()
 	ret, ok := c.cfgCache[instance]
 	c.cfgL.RUnlock()
@@ -248,7 +250,7 @@ func (c *Client) cachedCfg(instance string) (string, *tls.Config) {
 // Dial uses the configuration stored in the client to connect to an instance.
 // If this func returns a nil error the connection is correctly authenticated
 // to connect to the instance.
-func (c *Client) Dial(instance string) (net.Conn, error) {
+func (c *Client) Dial(instance util.Instance) (net.Conn, error) {
 	if addr, cfg := c.cachedCfg(instance); cfg != nil {
 		ret, err := c.tryConnect(addr, cfg)
 		if err == nil {
@@ -299,7 +301,7 @@ func (c *Client) tryConnect(addr string, cfg *tls.Config) (net.Conn, error) {
 // on the passed Listener. All requests sent to the returned chan will have the
 // instance name provided here. The chan will be closed if the Listener returns
 // an error.
-func NewConnSrc(instance string, l net.Listener) <-chan Conn {
+func NewConnSrc(instance util.Instance, l net.Listener) <-chan Conn {
 	ch := make(chan Conn)
 	go func() {
 		for {

@@ -48,6 +48,7 @@ import (
 	"bazil.org/fuse/fs"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
 	"golang.org/x/net/context"
 )
 
@@ -163,13 +164,19 @@ var _ interface {
 	fs.HandleReadDirAller
 } = &fsRoot{}
 
-func (r *fsRoot) newConn(instance string, c net.Conn) {
+func (r *fsRoot) newConn(instanceName string, c net.Conn) {
+	instance, err := util.NewInstance(instanceName)
+	if err != nil {
+		logging.Errorf("%v", err)
+		return
+	}
+
 	r.RLock()
 	// dst will be nil if Close has been called already.
 	if ch := r.dst; ch != nil {
 		ch <- proxy.Conn{instance, c}
 	} else {
-		logging.Errorf("Ignored new conn request to %q: system has been closed", instance)
+		logging.Errorf("Ignored new conn request to %q: system has been closed", instanceName)
 	}
 	r.RUnlock()
 }

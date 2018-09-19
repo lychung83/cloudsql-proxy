@@ -90,7 +90,7 @@ func TestSingleInstance(t *testing.T) {
 	}
 	defer fuse.Close()
 
-	const want = "test:instance"
+	const want = "test:region:instance"
 	path := filepath.Join(dir, want)
 
 	fi, err := os.Stat(path)
@@ -111,8 +111,8 @@ func TestSingleInstance(t *testing.T) {
 	got, ok := <-src
 	if !ok {
 		t.Fatal("connection source was closed, expected a connection")
-	} else if got.Instance != want {
-		t.Fatalf("got %q, want %q", got.Instance, want)
+	} else if gotInstance := got.Instance.String(); gotInstance != want {
+		t.Fatalf("got %v, want %q", gotInstance, want)
 	} else if got.Conn == nil {
 		t.Fatal("got nil connection, wanted a connection")
 	}

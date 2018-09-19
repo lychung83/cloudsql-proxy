@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/certs"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
 )
@@ -34,14 +35,18 @@ var dialClient struct {
 }
 
 // Dial returns a net.Conn connected to the Cloud SQL Instance specified. The
-// format of 'instance' is "project-name:region:instance-name".
+// format of 'instanceName' is "project-name:region:instance-name".
 //
 // If one of the Init functions hasn't been called yet, InitDefault is called.
 //
 // This is a network-level function; consider looking in the dialers
 // subdirectory for more convenience functions related to actually logging into
 // your database.
-func Dial(instance string) (net.Conn, error) {
+func Dial(instanceName string) (net.Conn, error) {
+	instance, err := util.NewInstance(instanceName)
+	if err != nil {
+		return nil, err
+	}
 	dialClient.Lock()
 	c := dialClient.c
 	dialClient.Unlock()
@@ -71,7 +76,7 @@ func Init(auth *http.Client, connset *ConnSet, dialer Dialer) {
 	dialClient.Lock()
 	dialClient.c = &Client{
 		Port:   port,
-		Certs:  certs.NewCertSource("https://www.googleapis.com/sql/v1beta4/", auth, true),
+		Certs:  certs.NewCertSource("https://www.googleapis.com/sql/v1beta4/", auth),
 		Conns:  connset,
 		Dialer: dialer,
 	}

@@ -15,31 +15,44 @@
 // Package util contains utility functions for use throughout the Cloud SQL Proxy.
 package util
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
-// SplitName splits a fully qualified instance into its project, region, and
-// instance name components. While we make the transition to regionalized
-// metadata, the region is optional.
+// Instance represents fully qualified instance name. It should be initialized by NewInstance.
+type Instance struct {
+	Project, Region, Database string
+}
+
+// NewInstance makes an Instance object by splitting a fully qualified instance name into its
+// project, region, and instance name components. project, region, instance names are all required.
+// project name may optionally preceded by organization name.
 //
 // Examples:
-//    "proj:region:my-db" -> ("proj", "region", "my-db")
-//		"google.com:project:region:instance" -> ("google.com:project", "region", "instance")
-//		"google.com:missing:part" -> ("google.com:missing", "", "part")
-func SplitName(instance string) (project, region, name string) {
-	spl := strings.Split(instance, ":")
-	if len(spl) < 2 {
-		return "", "", instance
-	}
-	if dot := strings.Index(spl[0], "."); dot != -1 {
-		spl[1] = spl[0] + ":" + spl[1]
-		spl = spl[1:]
-	}
-	switch {
-	case len(spl) < 2:
-		return "", "", instance
-	case len(spl) == 2:
-		return spl[0], "", spl[1]
+//    "proj:region:my-db" -> Instance{"proj", "region", "my-db"}, true
+//    "google.com:project:region:instance" ->
+//        Instance{"google.com:project", "region", "instance"}, true
+//    "google.com:missing:part" -> Instance{}, false
+func NewInstance(name string) (Instance, error) {
+	err := fmt.Errorf("invalid instance name: must be in the form `project:region:instance-name`; invalid name was %q", name)
+	spl := strings.Split(name, ":")
+	switch len(spl) {
+	case 3:
+		if strings.ContainsRune(spl[0], '.') {
+			return Instance{}, err
+		}
+		return Instance{spl[0], spl[1], spl[2]}, nil
+	case 4:
+		if !strings.ContainsRune(spl[0], '.') {
+			return Instance{}, err
+		}
+		return Instance{fmt.Sprintf("%s:%s", spl[0], spl[1]), spl[2], spl[3]}, nil
 	default:
-		return spl[0], spl[1], spl[2]
+		return Instance{}, err
 	}
+}
+
+func (inst Instance) String() string {
+	return fmt.Sprintf("%s:%s:%s", inst.Project, inst.Region, inst.Database)
 }

@@ -16,23 +16,50 @@ package util
 
 import "testing"
 
-func TestSplitName(t *testing.T) {
-	table := []struct{ in, wantProj, wantRegion, wantInstance string }{
-		{"proj:region:my-db", "proj", "region", "my-db"},
-		{"google.com:project:region:instance", "google.com:project", "region", "instance"},
-		{"google.com:missing:part", "google.com:missing", "", "part"},
+func TestNewInstance(t *testing.T) {
+	table := []struct {
+		in, wantProj, wantRegion, wantInstance string
+		wantErr                                bool
+	}{
+		{"proj:region:my-db", "proj", "region", "my-db", false},
+		{"google.com:project:region:instance", "google.com:project", "region", "instance", false},
+		{"google.com:missing:part", "", "", "", true},
+		{"proj:my-db", "", "", "", true},
+		{"googlecom:project:region:instance", "", "", "", true},
+		{"google:com:project:region:instance", "", "", "", true},
 	}
 
 	for _, test := range table {
-		gotProj, gotRegion, gotInstance := SplitName(test.in)
+		inst, err := NewInstance(test.in)
+		gotProj, gotRegion, gotInstance := inst.Project, inst.Region, inst.Database
 		if gotProj != test.wantProj {
-			t.Errorf("splitName(%q): got %v for project, want %v", test.in, gotProj, test.wantProj)
+			t.Errorf("NewInstance(%q): got %v for project, want %v", test.in, gotProj, test.wantProj)
 		}
 		if gotRegion != test.wantRegion {
-			t.Errorf("splitName(%q): got %v for region, want %v", test.in, gotRegion, test.wantRegion)
+			t.Errorf("NewInstance(%q): got %v for region, want %v", test.in, gotRegion, test.wantRegion)
 		}
 		if gotInstance != test.wantInstance {
-			t.Errorf("splitName(%q): got %v for instance, want %v", test.in, gotInstance, test.wantInstance)
+			t.Errorf("NewInstance(%q): got %v for instance, want %v", test.in, gotInstance, test.wantInstance)
+		}
+		if (err != nil) != test.wantErr {
+			t.Errorf("NewInstance(%q) returned err: %v, wantErr %t", test.in, err, test.wantErr)
+		}
+	}
+}
+
+func TestInstanceString(t *testing.T) {
+	table := []struct {
+		project, region, database, wantStr string
+	}{
+		{"proj", "region", "my-db", "proj:region:my-db"},
+		{"google.com:project", "region", "instance", "google.com:project:region:instance"},
+	}
+
+	for _, test := range table {
+		inst := Instance{test.project, test.region, test.database}
+		gotStr := inst.String()
+		if gotStr != test.wantStr {
+			t.Errorf("string of %#v: got %s, want %s", inst, gotStr, test.wantStr)
 		}
 	}
 }

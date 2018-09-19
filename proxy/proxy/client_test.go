@@ -24,9 +24,14 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
 )
 
-const instance = "instance-name"
+var (
+	dbName   = "database"
+	instance = util.Instance{"project", "region", dbName}
+)
 
 var errFakeDial = errors.New("this error is returned by the dialer")
 
@@ -36,10 +41,10 @@ type fakeCerts struct {
 }
 
 type blockingCertSource struct {
-	values map[string]*fakeCerts
+	values map[util.Instance]*fakeCerts
 }
 
-func (cs *blockingCertSource) Local(instance string) (tls.Certificate, error) {
+func (cs *blockingCertSource) Local(instance util.Instance) (tls.Certificate, error) {
 	v, ok := cs.values[instance]
 	if !ok {
 		return tls.Certificate{}, fmt.Errorf("test setup failure: unknown instance %q", instance)
@@ -57,7 +62,7 @@ func (cs *blockingCertSource) Local(instance string) (tls.Certificate, error) {
 	}, nil
 }
 
-func (cs *blockingCertSource) Remote(instance string) (cert *x509.Certificate, addr, name string, err error) {
+func (cs *blockingCertSource) Remote(instance util.Instance) (cert *x509.Certificate, addr, name string, err error) {
 	return &x509.Certificate{}, "fake address", "fake name", nil
 }
 
@@ -65,7 +70,7 @@ func TestClientCache(t *testing.T) {
 	b := &fakeCerts{}
 	c := &Client{
 		Certs: &blockingCertSource{
-			map[string]*fakeCerts{
+			map[util.Instance]*fakeCerts{
 				instance: b,
 			}},
 		Dialer: func(string, string) (net.Conn, error) {
@@ -90,7 +95,7 @@ func TestConcurrentRefresh(t *testing.T) {
 	b := &fakeCerts{}
 	c := &Client{
 		Certs: &blockingCertSource{
-			map[string]*fakeCerts{
+			map[util.Instance]*fakeCerts{
 				instance: b,
 			}},
 		Dialer: func(string, string) (net.Conn, error) {
@@ -131,7 +136,7 @@ func TestMaximumConnectionsCount(t *testing.T) {
 
 	b := &fakeCerts{}
 	certSource := blockingCertSource{
-		map[string]*fakeCerts{}}
+		map[util.Instance]*fakeCerts{}}
 	firstDialExited := make(chan struct{})
 	c := &Client{
 		Certs: &certSource,
@@ -147,29 +152,29 @@ func TestMaximumConnectionsCount(t *testing.T) {
 	}
 
 	// Build certSource.values before creating goroutines to avoid concurrent map read and map write
-	instanceNames := make([]string, numConnections)
+	instances := make([]util.Instance, numConnections)
 	for i := 0; i < numConnections; i++ {
 		// Vary instance name to bypass config cache and avoid second call to Client.tryConnect() in Client.Dial()
-		instanceName := fmt.Sprintf("%s-%d", instance, i)
-		certSource.values[instanceName] = b
-		instanceNames[i] = instanceName
+		instance := util.Instance{"project", "region", fmt.Sprintf("%s-%d", dbName, i)}
+		certSource.values[instance] = b
+		instances[i] = instance
 	}
 
 	var wg sync.WaitGroup
 	var firstDialOnce sync.Once
-	for _, instanceName := range instanceNames {
+	for _, instance := range instances {
 		wg.Add(1)
-		go func(instanceName string) {
+		go func(instance util.Instance) {
 			defer wg.Done()
 
 			conn := Conn{
-				Instance: instanceName,
+				Instance: instance,
 				Conn:     &dummyConn{},
 			}
 			c.handleConn(conn)
 
 			firstDialOnce.Do(func() { close(firstDialExited) })
-		}(instanceName)
+		}(instance)
 	}
 
 	wg.Wait()

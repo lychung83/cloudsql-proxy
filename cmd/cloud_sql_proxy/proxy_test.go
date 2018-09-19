@@ -20,6 +20,8 @@ import (
 	"net"
 	"net/http"
 	"testing"
+
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
 )
 
 type mockTripper struct {
@@ -105,19 +107,19 @@ func TestParseInstanceConfig(t *testing.T) {
 	}{
 		{
 			"/x", "domain.com:my-proj:my-reg:my-instance",
-			instanceConfig{"domain.com:my-proj:my-reg:my-instance", "unix", "/x/domain.com:my-proj:my-reg:my-instance"},
+			instanceConfig{util.Instance{"domain.com:my-proj", "my-reg", "my-instance"}, "unix", "/x/domain.com:my-proj:my-reg:my-instance"},
 			false, false,
 		}, {
 			"/x", "my-proj:my-reg:my-instance",
-			instanceConfig{"my-proj:my-reg:my-instance", "unix", "/x/my-proj:my-reg:my-instance"},
+			instanceConfig{util.Instance{"my-proj", "my-reg", "my-instance"}, "unix", "/x/my-proj:my-reg:my-instance"},
 			false, false,
 		}, {
 			"/x", "my-proj:my-reg:my-instance=tcp:1234",
-			instanceConfig{"my-proj:my-reg:my-instance", "tcp", "[::1]:1234"},
+			instanceConfig{util.Instance{"my-proj", "my-reg", "my-instance"}, "tcp", "[::1]:1234"},
 			false, true,
 		}, {
 			"/x", "my-proj:my-reg:my-instance=tcp:my-host:1111",
-			instanceConfig{"my-proj:my-reg:my-instance", "tcp", "my-host:1111"},
+			instanceConfig{util.Instance{"my-proj", "my-reg", "my-instance"}, "tcp", "my-host:1111"},
 			false, false,
 		}, {
 			"/x", "my-proj:my-reg:my-instance=",

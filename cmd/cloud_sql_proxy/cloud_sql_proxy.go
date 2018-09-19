@@ -52,8 +52,6 @@ var (
 	quiet   = flag.Bool("quiet", false, "Disable log messages")
 
 	refreshCfgThrottle = flag.Duration("refresh_config_throttle", proxy.DefaultRefreshCfgThrottle, "If set, this flag specifies the amount of forced sleep between successive API calls in order to protect client API quota. Minimum allowed value is "+minimumRefreshCfgThrottle.String())
-	checkRegion        = flag.Bool("check_region", false, `If specified, the 'region' portion of the connection string is required for
-Unix socket-based connections.`)
 
 	// Settings for how to choose which instance to connect to.
 	dir      = flag.String("dir", "", "Directory to use for placing Unix sockets representing database instances")
@@ -487,7 +485,6 @@ func main() {
 		MaxConnections: *maxConnections,
 		Certs: certs.NewCertSourceOpts(client, certs.RemoteOpts{
 			APIBasePath:    *host,
-			IgnoreRegion:   !*checkRegion,
 			UserAgent:      userAgentFromVersionString(),
 			IPAddrTypeOpts: ipAddrTypeOptsInput,
 		}),
