@@ -25,7 +25,7 @@ import (
 )
 
 // Functions in this file is used to convert RowData to monitoring point that are used by uploading
-// monitoring API calls. All functions in this file are copied from
+// monitoring API calls. All functions except newStringPoint in this file are copied from
 // contrib.go.opencensus.io/exporter/stackdriver.
 
 func newPoint(v *view.View, row *view.Row, start, end time.Time) *mpb.Point {
@@ -34,6 +34,24 @@ func newPoint(v *view.View, row *view.Row, start, end time.Time) *mpb.Point {
 		return newGaugePoint(v, row, end)
 	default:
 		return newCumulativePoint(v, row, start, end)
+	}
+}
+
+// newStringPoint returns a metric point with string value.
+func newStringPoint(val string, end time.Time) *mpb.Point {
+	gaugeTime := &tspb.Timestamp{
+		Seconds: end.Unix(),
+		Nanos:   int32(end.Nanosecond()),
+	}
+	return &mpb.Point{
+		Interval: &mpb.TimeInterval{
+			EndTime: gaugeTime,
+		},
+		Value: &mpb.TypedValue{
+			Value: &mpb.TypedValue_StringValue{
+				StringValue: val,
+			},
+		},
 	}
 }
 

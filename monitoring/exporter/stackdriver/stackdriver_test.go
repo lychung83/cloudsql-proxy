@@ -20,6 +20,7 @@ import (
 
 	"go.opencensus.io/stats/view"
 	mrpb "google.golang.org/genproto/googleapis/api/monitoredres"
+	mpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
 
 // This file contains actual tests.
@@ -36,6 +37,7 @@ func TestAll(t *testing.T) {
 		{"UploadNoError", testUploadNoError},
 		{"UploadTimeSeriesMakeError", testUploadTimeSeriesMakeError},
 		{"UploadWithMetricClientError", testUploadWithMetricClientError},
+		{"StringValueMetric", testStringValueMetric},
 		{"MakeResource", testMakeResource},
 		{"MakeLabel", testMakeLabel},
 	}
@@ -72,7 +74,7 @@ func testProjectClassifyNoError(t *testing.T) {
 		case view1row2:
 			return project2, nil
 		default:
-			return "", unrecognizedDataError
+			return "", errUnrecognizedData
 		}
 	}
 
@@ -121,11 +123,11 @@ func testProjectClassifyError(t *testing.T) {
 		case view1row1, view2row2:
 			return project1, nil
 		case view1row2:
-			return "", RowDataNotApplicableError
+			return "", ErrRowDataNotApplicable
 		case view2row1:
-			return "", invalidDataError
+			return "", errInvalidData
 		default:
-			return "", unrecognizedDataError
+			return "", errUnrecognizedData
 		}
 	}
 
@@ -139,7 +141,7 @@ func testProjectClassifyError(t *testing.T) {
 	wantErrRdCheck := []errRowDataCheck{
 		{
 			errPrefix: "failed to get project ID",
-			errSuffix: invalidDataErrStr,
+			errSuffix: invalidDataStr,
 			rds:       []*RowData{{view2, startTime2, endTime2, view2row1}},
 		},
 	}
@@ -244,7 +246,7 @@ func testUploadNoError(t *testing.T) {
 func testUploadTimeSeriesMakeError(t *testing.T) {
 	makeResource := func(rd *RowData) (*mrpb.MonitoredResource, error) {
 		if rd.Row == view1row2 {
-			return nil, invalidDataError
+			return nil, errInvalidData
 		}
 		return defaultMakeResource(rd)
 	}
@@ -266,7 +268,7 @@ func testUploadTimeSeriesMakeError(t *testing.T) {
 	wantErrRdCheck := []errRowDataCheck{
 		{
 			errPrefix: "failed to construct resource",
-			errSuffix: invalidDataErrStr,
+			errSuffix: invalidDataStr,
 			rds:       []*RowData{{view1, startTime1, endTime1, view1row2}},
 		}, {
 			errPrefix: "inconsistent data found in view",
@@ -294,7 +296,7 @@ func testUploadWithMetricClientError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	timeSeriesResults = append(timeSeriesResults, invalidDataError)
+	timeSeriesResults = append(timeSeriesResults, nil, errInvalidData)
 	rd := []*RowData{
 		{view1, startTime1, endTime1, view1row1},
 		{view1, startTime1, endTime1, view1row2},
@@ -307,11 +309,10 @@ func testUploadWithMetricClientError(t *testing.T) {
 	wantErrRdCheck := []errRowDataCheck{
 		{
 			errPrefix: "monitoring API call to create time series failed",
-			errSuffix: invalidDataErrStr,
+			errSuffix: invalidDataStr,
 			rds: []*RowData{
-				{view1, startTime1, endTime1, view1row1},
-				{view1, startTime1, endTime1, view1row2},
-				{view1, startTime1, endTime1, view1row3},
+				{view2, startTime2, endTime2, view2row1},
+				{view2, startTime2, endTime2, view2row2},
 			},
 		},
 	}
@@ -328,6 +329,52 @@ func testUploadWithMetricClientError(t *testing.T) {
 	}
 }
 
+// testStringValueMetric tests that exporter can detect string valued metric by IsValueString given
+// in option.
+func testStringValueMetric(t *testing.T) {
+	isValueString := func(rd *RowData) (string, bool, error) {
+		switch rd.Row {
+		case view1row1:
+			return "string_value", true, nil
+		case view1row2:
+			return "", false, nil
+		default:
+			return "", false, errUnrecognizedData
+		}
+	}
+	pd, err := newTestProjData(Options{IsValueString: isValueString})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := []*RowData{
+		{view1, startTime1, endTime1, view1row1},
+		{view1, startTime1, endTime1, view1row2},
+		{view1, startTime1, endTime1, view1row3},
+	}
+	pd.uploadRowData(rd)
+	wantErrRdCheck := []errRowDataCheck{
+		{
+			errPrefix: "failed to check whether row data is string valued or not",
+			errSuffix: metric1name,
+			rds:       []*RowData{{view1, startTime1, endTime1, view1row3}},
+		},
+	}
+	if err := checkErrStorage(wantErrRdCheck); err != nil {
+		t.Error(err)
+	}
+	wantVals := []interface{}{"string_value", int64(2)}
+	tsArr := timeSeriesReqs[0].TimeSeries
+	tsVals := []interface{}{
+		tsArr[0].Points[0].Value.Value.(*mpb.TypedValue_StringValue).StringValue,
+		tsArr[1].Points[0].Value.Value.(*mpb.TypedValue_Int64Value).Int64Value,
+	}
+	for i := 0; i < len(tsVals); i++ {
+		if tsVal, wantVal := tsVals[i], wantVals[i]; tsVal != wantVal {
+			t.Errorf("%d-th time series value mismatch: got %v, want %v", i+1, tsVal, wantVal)
+		}
+	}
+}
+
 // testMakeResource tests that exporter can create monitored resource dynamically.
 func testMakeResource(t *testing.T) {
 	makeResource := func(rd *RowData) (*mrpb.MonitoredResource, error) {
@@ -337,7 +384,7 @@ func testMakeResource(t *testing.T) {
 		case view1row2:
 			return resource2, nil
 		default:
-			return nil, unrecognizedDataError
+			return nil, errUnrecognizedData
 		}
 	}
 	pd, err := newTestProjData(Options{MakeResource: makeResource})

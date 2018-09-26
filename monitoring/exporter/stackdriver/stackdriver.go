@@ -103,6 +103,10 @@ type Options struct {
 	// row data will not be uploaded to stackdriver. When MakeResource is not set, global
 	// resource is used for all RowData objects.
 	MakeResource func(rd *RowData) (*mrpb.MonitoredResource, error)
+	// IsValueString tells that whether the value in the row data is a string, and return the
+	// string value if it is. This function circumvents the restriction that opencensus metrics
+	// do not support string value. When IsValueString is not set, it always returns false.
+	IsValueString func(rd *RowData) (string, bool, error)
 
 	// Options concerning labels.
 
@@ -129,7 +133,7 @@ func defaultGetProjectID(rd *RowData) (string, error) {
 			return tag.Value, nil
 		}
 	}
-	return "", RowDataNotApplicableError
+	return "", ErrRowDataNotApplicable
 }
 
 func defaultOnError(err error, rds ...*RowData) {}
@@ -138,13 +142,19 @@ func defaultMakeResource(rd *RowData) (*mrpb.MonitoredResource, error) {
 	return &mrpb.MonitoredResource{Type: "global"}, nil
 }
 
+func defaultIsValueString(rd *RowData) (string, bool, error) {
+	return "", false, nil
+}
+
 // Following functions are wrapper of functions those will be mocked by tests. Only tests can modify
 // these functions.
 var (
 	newMetricClient  = monitoring.NewMetricClient
-	createTimeSeries = (*monitoring.MetricClient).CreateTimeSeries
-	newBundler       = bundler.NewBundler
-	addToBundler     = (*bundler.Bundler).Add
+	createTimeSeries = func(ctx context.Context, c *monitoring.MetricClient, ts *mpb.CreateTimeSeriesRequest) error {
+		return c.CreateTimeSeries(ctx, ts)
+	}
+	newBundler   = bundler.NewBundler
+	addToBundler = (*bundler.Bundler).Add
 )
 
 // NewExporter creates an Exporter object. Once a call to NewExporter is made, any fields in opts
@@ -178,6 +188,9 @@ func NewExporter(ctx context.Context, opts Options) (*Exporter, error) {
 	if e.opts.MakeResource == nil {
 		e.opts.MakeResource = defaultMakeResource
 	}
+	if e.opts.IsValueString == nil {
+		e.opts.IsValueString = defaultIsValueString
+	}
 
 	return e, nil
 }
@@ -205,16 +218,16 @@ func (e *Exporter) ExportView(vd *view.Data) {
 	}
 }
 
-// RowDataNotApplicableError is used to tell that given row data is not applicable to the exporter.
+// ErrRowDataNotApplicable is used to tell that given row data is not applicable to the exporter.
 // See GetProjectID of Options for more detail.
-var RowDataNotApplicableError = errors.New("row data is not applicable to the exporter, so it will be ignored")
+var ErrRowDataNotApplicable = errors.New("row data is not applicable to the exporter, so it will be ignored")
 
 // exportRowData exports a single row data.
 func (e *Exporter) exportRowData(rd *RowData) {
 	projID, err := e.opts.GetProjectID(rd)
 	if err != nil {
 		// We ignore non-applicable RowData.
-		if err != RowDataNotApplicableError {
+		if err != ErrRowDataNotApplicable {
 			newErr := fmt.Errorf("failed to get project ID on row data with view %s: %v", rd.View.Name, err)
 			e.opts.OnError(newErr, rd)
 		}
@@ -273,10 +286,18 @@ func (e *Exporter) Close() error {
 
 // makeTS constructs a time series from a row data.
 func (e *Exporter) makeTS(rd *RowData) (*mpb.TimeSeries, error) {
-	pt := newPoint(rd.View, rd.Row, rd.Start, rd.End)
-	if pt.Value == nil {
-		return nil, fmt.Errorf("inconsistent data found in view %s", rd.View.Name)
+	var pt *mpb.Point
+	if strVal, ok, err := e.opts.IsValueString(rd); err != nil {
+		return nil, fmt.Errorf("failed to check whether row data is string valued or not in view: %v", rd.View.Name)
+	} else if ok {
+		pt = newStringPoint(strVal, rd.End)
+	} else {
+		pt = newPoint(rd.View, rd.Row, rd.Start, rd.End)
+		if pt.Value == nil {
+			return nil, fmt.Errorf("inconsistent data found in view %s", rd.View.Name)
+		}
 	}
+
 	resource, err := e.opts.MakeResource(rd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to construct resource of view %s: %v", rd.View.Name, err)
@@ -292,7 +313,7 @@ func (e *Exporter) makeTS(rd *RowData) (*mpb.TimeSeries, error) {
 	return ts, nil
 }
 
-// makeLables constructs label that's ready for being uploaded to stackdriver.
+// makeLabels constructs label that's ready for being uploaded to stackdriver.
 func (e *Exporter) makeLabels(tags []tag.Tag) map[string]string {
 	opts := e.opts
 	labels := make(map[string]string, len(opts.DefaultLabels)+len(tags))

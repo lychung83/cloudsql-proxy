@@ -36,10 +36,10 @@ func (pd *projectData) uploadRowData(bundle interface{}) {
 	rds := bundle.([]*RowData)
 
 	// uploadTs contains TimeSeries objects that needs to be uploaded.
-	var uploadTs []*mpb.TimeSeries = nil
+	var uploadTs []*mpb.TimeSeries
 	// uploadRds contains RowData objects corresponds to uploadTs. It's used for error reporting
 	// when upload operation fails.
-	var uploadRds []*RowData = nil
+	var uploadRds []*RowData
 
 	for _, rd := range rds {
 		ts, err := exp.makeTS(rd)
@@ -71,7 +71,7 @@ func (pd *projectData) uploadTimeSeries(ts []*mpb.TimeSeries, rds []*RowData) {
 		Name:       fmt.Sprintf("projects/%s", pd.projectID),
 		TimeSeries: ts,
 	}
-	if err := createTimeSeries(exp.client, exp.ctx, req); err != nil {
+	if err := createTimeSeries(exp.ctx, exp.client, req); err != nil {
 		newErr := fmt.Errorf("monitoring API call to create time series failed for project %s: %v", pd.projectID, err)
 		// We pass all row data not successfully uploaded.
 		exp.opts.OnError(newErr, rds...)

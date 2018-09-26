@@ -20,7 +20,6 @@ import (
 	"strings"
 
 	monitoring "cloud.google.com/go/monitoring/apiv3"
-	gax "github.com/googleapis/gax-go"
 	"google.golang.org/api/option"
 	"google.golang.org/api/support/bundler"
 	mpb "google.golang.org/genproto/googleapis/monitoring/v3"
@@ -72,7 +71,7 @@ func mockNewMetricClient(_ context.Context, _ ...option.ClientOption) (*monitori
 	return nil, nil
 }
 
-func mockCreateTimeSeries(_ *monitoring.MetricClient, _ context.Context, req *mpb.CreateTimeSeriesRequest, _ ...gax.CallOption) error {
+func mockCreateTimeSeries(_ context.Context, _ *monitoring.MetricClient, req *mpb.CreateTimeSeriesRequest) error {
 	timeSeriesReqs = append(timeSeriesReqs, req)
 	// Check timeSeriesResults and if not empty, return the first error from it.
 	if len(timeSeriesResults) == 0 {
@@ -104,7 +103,7 @@ func mockAddToBundler(bndler *bundler.Bundler, item interface{}, _ int) error {
 		}
 	}
 	if !projIDfound {
-		return unrecognizedDataError
+		return errUnrecognizedData
 	}
 
 	rds, ok := projRds[projID]

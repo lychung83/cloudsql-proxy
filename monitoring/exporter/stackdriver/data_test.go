@@ -58,11 +58,11 @@ const (
 var (
 	ctx = context.Background()
 
-	invalidDataErrStr = "invalid data"
+	invalidDataStr = "invalid data"
 	// This error is used for test to catch some error happpened.
-	invalidDataError = errors.New(invalidDataErrStr)
+	errInvalidData = errors.New(invalidDataStr)
 	// This error is used for unexpected error.
-	unrecognizedDataError = errors.New("unrecognized data")
+	errUnrecognizedData = errors.New("unrecognized data")
 
 	key1       = getKey(label1name)
 	key2       = getKey(label2name)
