@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -29,7 +30,10 @@ func (m *mockTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: 200, Body: ioutil.NopCloser(bytes.NewReader([]byte("{}")))}, nil
 }
 
-var mockClient = &http.Client{Transport: &mockTripper{}}
+var (
+	ctx        = context.Background()
+	mockClient = &http.Client{Transport: &mockTripper{}}
+)
 
 func TestCreateInstanceConfigs(t *testing.T) {
 	for _, v := range []struct {
@@ -82,7 +86,7 @@ func TestCreateInstanceConfigs(t *testing.T) {
 			"", false, nil, "md", true,
 		},
 	} {
-		_, err := CreateInstanceConfigs(v.dir, v.useFuse, v.instances, v.instancesSrc, mockClient)
+		_, err := CreateInstanceConfigs(ctx, v.dir, v.useFuse, v.instances, v.instancesSrc, mockClient)
 		if v.wantErr {
 			if err == nil {
 				t.Errorf("CreateInstanceConfigs passed when %s, wanted error", v.desc)
@@ -100,44 +104,44 @@ func TestParseInstanceConfig(t *testing.T) {
 		// inputs
 		dir, instance string
 
-		wantCfg               instanceConfig
+		wantCfg               InstanceConfig
 		wantErr, wantLoopback bool
 	}{
 		{
 			"/x", "domain.com:my-proj:my-reg:my-instance",
-			instanceConfig{"domain.com:my-proj:my-reg:my-instance", "unix", "/x/domain.com:my-proj:my-reg:my-instance"},
+			InstanceConfig{"domain.com:my-proj:my-reg:my-instance", "unix", "/x/domain.com:my-proj:my-reg:my-instance"},
 			false, false,
 		}, {
 			"/x", "my-proj:my-reg:my-instance",
-			instanceConfig{"my-proj:my-reg:my-instance", "unix", "/x/my-proj:my-reg:my-instance"},
+			InstanceConfig{"my-proj:my-reg:my-instance", "unix", "/x/my-proj:my-reg:my-instance"},
 			false, false,
 		}, {
 			"/x", "my-proj:my-reg:my-instance=tcp:1234",
-			instanceConfig{"my-proj:my-reg:my-instance", "tcp", "[::1]:1234"},
+			InstanceConfig{"my-proj:my-reg:my-instance", "tcp", "[::1]:1234"},
 			false, true,
 		}, {
 			"/x", "my-proj:my-reg:my-instance=tcp:my-host:1111",
-			instanceConfig{"my-proj:my-reg:my-instance", "tcp", "my-host:1111"},
+			InstanceConfig{"my-proj:my-reg:my-instance", "tcp", "my-host:1111"},
 			false, false,
 		}, {
 			"/x", "my-proj:my-reg:my-instance=",
-			instanceConfig{},
+			InstanceConfig{},
 			true, false,
 		}, {
 			"/x", "my-proj:my-reg:my-instance=cool network",
-			instanceConfig{},
+			InstanceConfig{},
 			true, false,
 		}, {
 			"/x", "my-proj:my-reg:my-instance=cool network:1234",
-			instanceConfig{},
+			InstanceConfig{},
 			true, false,
 		}, {
 			"/x", "my-proj:my-reg:my-instance=oh:so:many:colons",
-			instanceConfig{},
+			InstanceConfig{},
 			true, false,
 		},
 	} {
-		got, err := parseInstanceConfig(v.dir, v.instance, mockClient)
+		got, err := parseInstanceConfig(ctx, v.dir, v.instance, mockClient)
 		if v.wantErr {
 			if err == nil {
 				t.Errorf("parseInstanceConfig(%s, %s) = %+v, wanted error", v.dir, v.instance, got)

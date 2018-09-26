@@ -16,6 +16,7 @@
 package certs
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -30,7 +31,13 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/metrics"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/record"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/tag"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/recutil"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
+
+	octag "go.opencensus.io/tag"
 	"google.golang.org/api/googleapi"
 	sqladmin "google.golang.org/api/sqladmin/v1beta4"
 )
@@ -133,10 +140,19 @@ const (
 	backoffRetries = 5
 )
 
-func backoffAPIRetry(desc, instance string, do func() error) error {
+func backoffAPIRetry(ctx context.Context, desc, instance, method string, do func() error) error {
 	var err error
 	for i := 0; i < backoffRetries; i++ {
 		err = do()
+		// We made an admin API call. Record the result.
+		recErr := record.Count(ctx, metrics.AdminAPIReqCount,
+			octag.Tag{tag.APIMethodKey, method},
+			octag.Tag{tag.RespCodeKey, recutil.RespCode(err)},
+		)
+		if recErr != nil {
+			logging.Errorf("%v", recutil.Err(instance, metrics.AdminAPIReqCount, recErr))
+		}
+
 		gErr, ok := err.(*googleapi.Error)
 		switch {
 		case !ok:
@@ -163,10 +179,10 @@ func backoffAPIRetry(desc, instance string, do func() error) error {
 
 // Local returns a certificate that may be used to establish a TLS
 // connection to the specified instance.
-func (s *RemoteCertSource) Local(instance string) (ret tls.Certificate, err error) {
+func (s *RemoteCertSource) Local(ctx context.Context, instance string) (ret tls.Certificate, termCode string, err error) {
 	pkix, err := x509.MarshalPKIXPublicKey(&s.key.PublicKey)
 	if err != nil {
-		return ret, err
+		return ret, "error on parsing public key of ephemeral certificate", err
 	}
 
 	p, _, n := util.SplitName(instance)
@@ -177,23 +193,23 @@ func (s *RemoteCertSource) Local(instance string) (ret tls.Certificate, err erro
 	)
 
 	var data *sqladmin.SslCert
-	err = backoffAPIRetry("createEphemeral for", instance, func() error {
+	err = backoffAPIRetry(ctx, "createEphemeral for", instance, "SslCerts.CreateEphemeral", func() error {
 		data, err = req.Do()
 		return err
 	})
 	if err != nil {
-		return ret, err
+		return ret, recutil.AdminAPIErr, err
 	}
 
 	c, err := parseCert(data.Cert)
 	if err != nil {
-		return ret, fmt.Errorf("couldn't parse ephemeral certificate for instance %q: %v", instance, err)
+		return ret, "ephemeral certificate parsing error", fmt.Errorf("couldn't parse ephemeral certificate for instance %q: %v", instance, err)
 	}
 	return tls.Certificate{
 		Certificate: [][]byte{c.Raw},
 		PrivateKey:  s.key,
 		Leaf:        c,
-	}, nil
+	}, recutil.OK, nil
 }
 
 func parseCert(pemCert string) (*x509.Certificate, error) {
@@ -204,13 +220,19 @@ func parseCert(pemCert string) (*x509.Certificate, error) {
 	return x509.ParseCertificate(bl.Bytes)
 }
 
-// Find the first matching IP address by user input IP address types
-func (s *RemoteCertSource) findIPAddr(data *sqladmin.DatabaseInstance, instance string) (ipAddrInUse string, err error) {
+// Find the first matching IP address by user input IP address types. The caller of this function
+// should always use the returned context after the call of this function.
+func (s *RemoteCertSource) findIPAddr(ctx context.Context, data *sqladmin.DatabaseInstance, instance string) (newCtx context.Context, ipAddrInUse, ipType string, err error) {
 	for _, eachIPAddrTypeByUser := range s.IPAddrTypes {
 		for _, eachIPAddrTypeOfInstance := range data.IpAddresses {
-			if strings.ToUpper(eachIPAddrTypeOfInstance.Type) == strings.ToUpper(eachIPAddrTypeByUser) {
+			ipType := strings.ToUpper(eachIPAddrTypeOfInstance.Type)
+			if ipType == strings.ToUpper(eachIPAddrTypeByUser) {
 				ipAddrInUse = eachIPAddrTypeOfInstance.IpAddress
-				return ipAddrInUse, nil
+				ctx, err := recutil.UpdateIPType(ctx, instance, ipType)
+				if err != nil {
+					logging.Errorf("%v", err)
+				}
+				return ctx, ipAddrInUse, ipType, nil
 			}
 		}
 	}
@@ -222,21 +244,22 @@ func (s *RemoteCertSource) findIPAddr(data *sqladmin.DatabaseInstance, instance 
 
 	ipAddrTypeOfUser := fmt.Sprintf("%v", s.IPAddrTypes)
 
-	return "", fmt.Errorf("User input IP address type %v does not match the instance %v, the instance's IP addresses are %v ", ipAddrTypeOfUser, instance, ipAddrTypesOfInstance)
+	return ctx, "", "", fmt.Errorf("User input IP address type %v does not match the instance %v, the instance's IP addresses are %v ", ipAddrTypeOfUser, instance, ipAddrTypesOfInstance)
 }
 
-// Remote returns the specified instance's CA certificate, address, and name.
-func (s *RemoteCertSource) Remote(instance string) (cert *x509.Certificate, addr, name string, err error) {
+// Remote returns the specified instance's CA certificate, address, and name. The caller of this
+// function should always use the returned context after the call of this function.
+func (s *RemoteCertSource) Remote(ctx context.Context, instance string) (newCtx context.Context, cert *x509.Certificate, addr, ipType, name, termCode string, err error) {
 	p, region, n := util.SplitName(instance)
 	req := s.serv.Instances.Get(p, n)
 
 	var data *sqladmin.DatabaseInstance
-	err = backoffAPIRetry("get instance", instance, func() error {
+	err = backoffAPIRetry(ctx, "get instance", instance, recutil.InstancesGet, func() error {
 		data, err = req.Do()
 		return err
 	})
 	if err != nil {
-		return nil, "", "", err
+		return ctx, nil, "", "", "", recutil.AdminAPIErr, err
 	}
 
 	// TODO(chowski): remove this when us-central is removed.
@@ -245,29 +268,34 @@ func (s *RemoteCertSource) Remote(instance string) (cert *x509.Certificate, addr
 	}
 	if data.Region != region {
 		if region == "" {
+			termCode = "instance does not provide region"
 			err = fmt.Errorf("instance %v doesn't provide region", instance)
 		} else {
+			termCode = "instance provided wrong region"
 			err = fmt.Errorf(`for connection string "%s": got region %q, want %q`, instance, region, data.Region)
 		}
 		if s.checkRegion {
-			return nil, "", "", err
+			return ctx, nil, "", "", "", termCode, err
 		}
 		logging.Errorf("%v", err)
 		logging.Errorf("WARNING: specifying the correct region in an instance string will become required in a future version!")
 	}
 
 	if len(data.IpAddresses) == 0 {
-		return nil, "", "", fmt.Errorf("no IP address found for %v", instance)
+		return ctx, nil, "", "", "", "no IP address found for the instance", fmt.Errorf("no IP address found for %v", instance)
 	}
 
 	// Find the first matching IP address by user input IP address types
 	ipAddrInUse := ""
-	ipAddrInUse, err = s.findIPAddr(data, instance)
+	ctx, ipAddrInUse, ipType, err = s.findIPAddr(ctx, data, instance)
 	if err != nil {
-		return nil, "", "", err
+		return ctx, nil, "", "", "", "user input IP address type does not match that of instance", err
 	}
 
+	termCode = recutil.OK
 	c, err := parseCert(data.ServerCaCert.Cert)
-
-	return c, ipAddrInUse, p + ":" + n, err
+	if err != nil {
+		termCode = "instance certificate parsing error"
+	}
+	return ctx, c, ipAddrInUse, ipType, p + ":" + n, termCode, err
 }

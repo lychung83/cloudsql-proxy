@@ -17,6 +17,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,9 @@ import (
 	"sync"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/metrics"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/record"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/recutil"
 )
 
 // SQLScope is the Google Cloud Platform scope required for executing API
@@ -52,14 +56,20 @@ func (d dbgConn) Close() error {
 	return err
 }
 
-// myCopy is similar to io.Copy, but reports whether the returned error was due
-// to a bad read or write. The returned error will never be nil
-func myCopy(dst io.Writer, src io.Reader) (readErr bool, err error) {
+// myCopy is similar to io.Copy, but reports whether the returned error was due to a bad read or
+// write. The returned error will never be nil. metric is either SentBytes or RcvBytes according to
+// the direction of data tranfer.
+func myCopy(ctx context.Context, instance string, metric *metrics.Metric, dst io.Writer, src io.Reader) (readErr bool, err error) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			if _, werr := dst.Write(buf[:n]); werr != nil {
+			wBytes, werr := dst.Write(buf[:n])
+			// Record transferred bytes regardless of error.
+			if recErr := record.Int(ctx, metric, int64(wBytes)); recErr != nil {
+				logging.Errorf("%v", recutil.Err(instance, metric, recErr))
+			}
+			if werr != nil {
 				if err == nil {
 					return false, werr
 				}
@@ -83,17 +93,24 @@ func copyError(readDesc, writeDesc string, readErr bool, err error) {
 	logging.Errorf("%v had error: %v", desc, err)
 }
 
-func copyThenClose(remote, local io.ReadWriteCloser, remoteDesc, localDesc string) {
+func copyThenClose(ctx context.Context, remote, local io.ReadWriteCloser, instance, localDesc string) (termCode string) {
 	firstErr := make(chan error, 1)
+	termCodeCh := make(chan string, 1)
 
 	go func() {
-		readErr, err := myCopy(remote, local)
+		readErr, err := myCopy(ctx, instance, metrics.SentBytes, remote, local)
 		select {
 		case firstErr <- err:
 			if readErr && err == io.EOF {
+				termCodeCh <- recutil.OK
 				logging.Verbosef("Client closed %v", localDesc)
 			} else {
-				copyError(localDesc, remoteDesc, readErr, err)
+				if readErr {
+					termCodeCh <- "error on reading from client"
+				} else {
+					termCodeCh <- "error on writing to instance"
+				}
+				copyError(localDesc, instance, readErr, err)
 			}
 			remote.Close()
 			local.Close()
@@ -101,13 +118,19 @@ func copyThenClose(remote, local io.ReadWriteCloser, remoteDesc, localDesc strin
 		}
 	}()
 
-	readErr, err := myCopy(local, remote)
+	readErr, err := myCopy(ctx, instance, metrics.RcvBytes, local, remote)
 	select {
 	case firstErr <- err:
 		if readErr && err == io.EOF {
-			logging.Verbosef("Instance %v closed connection", remoteDesc)
+			termCodeCh <- "instance closed connection"
+			logging.Verbosef("Instance %v closed connection", instance)
 		} else {
-			copyError(remoteDesc, localDesc, readErr, err)
+			if readErr {
+				termCodeCh <- "error on reading from instance"
+			} else {
+				termCodeCh <- "error on writing to client"
+			}
+			copyError(instance, localDesc, readErr, err)
 		}
 		remote.Close()
 		local.Close()
@@ -115,6 +138,7 @@ func copyThenClose(remote, local io.ReadWriteCloser, remoteDesc, localDesc strin
 		// In this case, the other goroutine exited first and already printed its
 		// error (and closed the things).
 	}
+	return <-termCodeCh
 }
 
 // NewConnSet initializes a new ConnSet and returns it.

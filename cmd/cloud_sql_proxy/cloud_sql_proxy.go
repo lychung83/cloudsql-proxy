@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,16 +34,20 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/monitoring"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/certs"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/clientcategory"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/fuse"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/limits"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/recutil"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
 
 	"cloud.google.com/go/compute/metadata"
-	"golang.org/x/net/context"
+	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 	goauth "golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 	sqladmin "google.golang.org/api/sqladmin/v1beta4"
 )
 
@@ -86,6 +91,10 @@ You may set the GOOGLE_APPLICATION_CREDENTIALS environment variable for the same
 
 	// Setting to choose what API to connect to
 	host = flag.String("host", "https://www.googleapis.com/sql/v1beta4/", "When set, the proxy uses this host as the base API path.")
+
+	doMonitor      = flag.Bool("monitor_enable", false, "Enable stackdriver monitoring.")
+	monReportDelay = flag.Duration("monitor_report_delay", monitoring.DefaultReportDelay, "Delay between aggregated report of monitored metrics. Too frequent report delay can cause unexpected errors. Value less or equal to 0 will be ignored.")
+	monErrLogDelay = flag.Duration("monitor_error_log_delay", monitoring.DefaultErrLogDelay, "Delay beween logging of errors caused by aggregated report of monitored metrics. Value less or equal to 0 will be ignored.")
 )
 
 const (
@@ -192,15 +201,6 @@ Information for all flags:
 
 var defaultTmp = filepath.Join(os.TempDir(), "cloudsql-proxy-tmp")
 
-// See https://github.com/GoogleCloudPlatform/gcloud-golang/issues/194
-func onGCE() bool {
-	res, err := http.Get("http://metadata.google.internal")
-	if err != nil {
-		return false
-	}
-	return res.Header.Get("Metadata-Flavor") == "Google"
-}
-
 const defaultVersionString = "NO_VERSION_SET"
 
 var versionString = defaultVersionString
@@ -209,19 +209,29 @@ var versionString = defaultVersionString
 // identifying this proxy process, or a blank string if versionString was not
 // set to an interesting value.
 func userAgentFromVersionString() string {
-	if versionString == defaultVersionString {
+	shortVersion := shortVersionString()
+	if shortVersion == defaultVersionString {
 		return ""
+	}
+	return "cloud_sql_proxy " + shortVersion
+}
+
+// shortVersionString is the shortened version string. We return defaultVersionString if
+// versionString was not set to an interesting value.
+// Example versionString (see build.sh):
+//    version 1.05; sha 0f69d99588991aba0879df55f92562f7e79d7ca1 built Mon May  2 17:57:05 UTC 2016
+//
+// We just return the part before the semicolon.
+func shortVersionString() string {
+	if versionString == defaultVersionString {
+		return defaultVersionString
 	}
 
-	// Example versionString (see build.sh):
-	//    version 1.05; sha 0f69d99588991aba0879df55f92562f7e79d7ca1 built Mon May  2 17:57:05 UTC 2016
-	//
-	// We just want the part before the semicolon.
 	semi := strings.IndexByte(versionString, ';')
 	if semi == -1 {
-		return ""
+		return defaultVersionString
 	}
-	return "cloud_sql_proxy " + versionString[:semi]
+	return versionString[:semi]
 }
 
 const accountErrorSuffix = `Please create a new VM with Cloud SQL access (scope) enabled under "Identity and API access". Alternatively, create a new "service account key" and specify it using the -credential_file parameter`
@@ -259,34 +269,42 @@ func checkFlags(onGCE bool) error {
 	return nil
 }
 
-func authenticatedClient(ctx context.Context) (*http.Client, error) {
+// authData checks authentication information provided by user and returns
+// 1. authenticated client suitable for SQL Admin API call.
+// 2. option for creating monitoring client that contains authentication information.
+func authData(ctx context.Context) (cl *http.Client, monClientOpts []option.ClientOption, err error) {
 	if f := *tokenFile; f != "" {
 		all, err := ioutil.ReadFile(f)
 		if err != nil {
-			return nil, fmt.Errorf("invalid json file %q: %v", f, err)
+			return nil, nil, fmt.Errorf("invalid json file %q: %v", f, err)
 		}
 		cfg, err := goauth.JWTConfigFromJSON(all, proxy.SQLScope)
 		if err != nil {
-			return nil, fmt.Errorf("invalid json file %q: %v", f, err)
+			return nil, nil, fmt.Errorf("invalid json file %q: %v", f, err)
 		}
 		logging.Infof("using credential file for authentication; email=%s", cfg.Email)
-		return cfg.Client(ctx), nil
+		return cfg.Client(ctx), []option.ClientOption{option.WithCredentialsFile(f)}, nil
 	} else if tok := *token; tok != "" {
 		src := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: tok})
-		return oauth2.NewClient(ctx, src), nil
+		return oauth2.NewClient(ctx, src), []option.ClientOption{option.WithTokenSource(src)}, nil
 	}
 
 	// If flags don't specify an auth source, try either gcloud or application default
 	// credentials.
+	var opts []option.ClientOption
 	src, err := util.GcloudTokenSource(ctx)
 	if err != nil {
 		src, err = goauth.DefaultTokenSource(ctx, proxy.SQLScope)
-	}
-	if err != nil {
-		return nil, err
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		// We got a token source from gcloud command, so use it for monitoring client
+		// creation.
+		opts = []option.ClientOption{option.WithTokenSource(src)}
 	}
 
-	return oauth2.NewClient(ctx, src), nil
+	return oauth2.NewClient(ctx, src), opts, nil
 }
 
 func stringList(s string) []string {
@@ -352,6 +370,26 @@ func gcloudProject() ([]string, error) {
 		return nil, fmt.Errorf("gcloud has no active project, you can set it by running `gcloud config set project <project>`")
 	}
 	return []string{cfg.Configuration.Properties.Core.Project}, nil
+}
+
+// monitorInit initializes monitoring facility.
+func monitorInit(ctx context.Context, clientOpts []option.ClientOption) error {
+	uuidStr := uuid.New().String()
+	opts := monitoring.Options{
+		ReportDelay:    *monReportDelay,
+		ErrLogDelay:    *monErrLogDelay,
+		ClientOptions:  clientOpts,
+		ClientCategory: clientcategory.Get(),
+		UUID:           uuidStr,
+	}
+	if err := monitoring.Initialize(ctx, opts); err != nil {
+		return fmt.Errorf("monitoring.Initialze() failed: %v", err)
+	}
+	// Set the version string that can be used throughout the monitoring.
+	recutil.Version = shortVersionString()
+
+	logging.Infof("Monitoring initialized. The unique identifier of cloudsql-proxy execution used by monitoring: %s\n", uuidStr)
+	return nil
 }
 
 // Main executes the main function of the proxy, allowing it to be called from tests.
@@ -423,15 +461,23 @@ func main() {
 		}
 	}
 
-	onGCE := onGCE()
+	onGCE := clientcategory.OnGCE()
 	if err := checkFlags(onGCE); err != nil {
 		log.Fatal(err)
 	}
 
 	ctx := context.Background()
-	client, err := authenticatedClient(ctx)
+	client, monClientOpts, err := authData(ctx)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	if *doMonitor {
+		if err := monitorInit(ctx, monClientOpts); err != nil {
+			logging.Errorf("initializing monitoring service failed, and no monitoring will be performed: %v", err)
+		} else {
+			defer monitoring.Close()
+		}
 	}
 
 	ins, err := listInstances(ctx, client, projList)
@@ -439,7 +485,7 @@ func main() {
 		log.Fatal(err)
 	}
 	instList = append(instList, ins...)
-	cfgs, err := CreateInstanceConfigs(*dir, *useFuse, instList, *instanceSrc, client)
+	cfgs, err := CreateInstanceConfigs(ctx, *dir, *useFuse, instList, *instanceSrc, client)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -477,7 +523,7 @@ func main() {
 			}()
 		}
 
-		c, err := WatchInstances(*dir, cfgs, updates, client)
+		c, err := WatchInstances(ctx, *dir, cfgs, updates, client)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -501,5 +547,5 @@ func main() {
 		}),
 		Conns:              connset,
 		RefreshCfgThrottle: refreshCfgThrottle,
-	}).Run(connSrc)
+	}).Run(ctx, connSrc)
 }
