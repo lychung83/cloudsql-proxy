@@ -133,7 +133,7 @@ var (
 			"Latency of proxy client connections.",
 			stats.UnitMilliseconds,
 		),
-		Agg:  view.Distribution(makeExpBucket(10, 1.5, 22)...),
+		Agg:  view.Distribution(makeExpBucket(1, 1.5, 22)...),
 		Keys: []octag.Key{tag.IPTypeKey},
 	}
 
