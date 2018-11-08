@@ -16,6 +16,7 @@
 package certs
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -30,7 +31,13 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/metrics"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/record"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/tag"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/recutil"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/termcode"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
+	octag "go.opencensus.io/tag"
 	"google.golang.org/api/googleapi"
 	sqladmin "google.golang.org/api/sqladmin/v1beta4"
 )
@@ -133,10 +140,18 @@ const (
 	backoffRetries = 5
 )
 
-func backoffAPIRetry(desc, instance string, do func() error) error {
+func backoffAPIRetry(ctx context.Context, desc, instance, method string, do func() error) error {
 	var err error
 	for i := 0; i < backoffRetries; i++ {
 		err = do()
+		recErr := record.Increment(ctx, metrics.AdminAPIReqCount,
+			octag.Tag{tag.APIMethodKey, method},
+			octag.Tag{tag.RespCodeKey, recutil.RespCode(err)},
+		)
+		if recErr != nil {
+			logging.Errorf("%v", recutil.Err(instance, metrics.AdminAPIReqCount, recErr))
+		}
+
 		gErr, ok := err.(*googleapi.Error)
 		switch {
 		case !ok:
@@ -163,10 +178,10 @@ func backoffAPIRetry(desc, instance string, do func() error) error {
 
 // Local returns a certificate that may be used to establish a TLS
 // connection to the specified instance.
-func (s *RemoteCertSource) Local(instance string) (ret tls.Certificate, err error) {
+func (s *RemoteCertSource) Local(ctx context.Context, instance string) (ret tls.Certificate, err error) {
 	pkix, err := x509.MarshalPKIXPublicKey(&s.key.PublicKey)
 	if err != nil {
-		return ret, err
+		return ret, termcode.Error{termcode.EphemCertPublicKeySerializeErr, err}
 	}
 
 	p, _, n := util.SplitName(instance)
@@ -177,17 +192,19 @@ func (s *RemoteCertSource) Local(instance string) (ret tls.Certificate, err erro
 	)
 
 	var data *sqladmin.SslCert
-	err = backoffAPIRetry("createEphemeral for", instance, func() error {
+	err = backoffAPIRetry(ctx, "createEphemeral for", instance, recutil.SslCertsCreateEphemeral, func() error {
 		data, err = req.Do()
 		return err
 	})
 	if err != nil {
-		return ret, err
+		return ret, termcode.Error{termcode.AdminAPIErr, err}
 	}
 
 	c, err := parseCert(data.Cert)
 	if err != nil {
-		return ret, fmt.Errorf("couldn't parse ephemeral certificate for instance %q: %v", instance, err)
+		err := termcode.Error{termcode.EphemCertParseErr, fmt.Errorf("couldn't parse ephemeral certificate for instance %q: %v", instance, err)}
+		return ret, err
+
 	}
 	return tls.Certificate{
 		Certificate: [][]byte{c.Raw},
@@ -205,12 +222,13 @@ func parseCert(pemCert string) (*x509.Certificate, error) {
 }
 
 // Find the first matching IP address by user input IP address types
-func (s *RemoteCertSource) findIPAddr(data *sqladmin.DatabaseInstance, instance string) (ipAddrInUse string, err error) {
+func (s *RemoteCertSource) findIPAddr(data *sqladmin.DatabaseInstance, instance string) (ipAddrInUse, ipType string, err error) {
 	for _, eachIPAddrTypeByUser := range s.IPAddrTypes {
 		for _, eachIPAddrTypeOfInstance := range data.IpAddresses {
-			if strings.ToUpper(eachIPAddrTypeOfInstance.Type) == strings.ToUpper(eachIPAddrTypeByUser) {
+			ipType := strings.ToUpper(eachIPAddrTypeOfInstance.Type)
+			if ipType == strings.ToUpper(eachIPAddrTypeByUser) {
 				ipAddrInUse = eachIPAddrTypeOfInstance.IpAddress
-				return ipAddrInUse, nil
+				return ipAddrInUse, ipType, nil
 			}
 		}
 	}
@@ -222,21 +240,21 @@ func (s *RemoteCertSource) findIPAddr(data *sqladmin.DatabaseInstance, instance 
 
 	ipAddrTypeOfUser := fmt.Sprintf("%v", s.IPAddrTypes)
 
-	return "", fmt.Errorf("User input IP address type %v does not match the instance %v, the instance's IP addresses are %v ", ipAddrTypeOfUser, instance, ipAddrTypesOfInstance)
+	return "", recutil.Unknown, fmt.Errorf("User input IP address type %v does not match the instance %v, the instance's IP addresses are %v ", ipAddrTypeOfUser, instance, ipAddrTypesOfInstance)
 }
 
-// Remote returns the specified instance's CA certificate, address, and name.
-func (s *RemoteCertSource) Remote(instance string) (cert *x509.Certificate, addr, name string, err error) {
+// Remote returns the specified instance's CA certificate, address, IP type, and name.
+func (s *RemoteCertSource) Remote(ctx context.Context, instance string) (cert *x509.Certificate, addr, ipType, name string, err error) {
 	p, region, n := util.SplitName(instance)
 	req := s.serv.Instances.Get(p, n)
 
 	var data *sqladmin.DatabaseInstance
-	err = backoffAPIRetry("get instance", instance, func() error {
+	err = backoffAPIRetry(ctx, "get instance", instance, recutil.InstancesGet, func() error {
 		data, err = req.Do()
 		return err
 	})
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", recutil.Unknown, "", termcode.Error{termcode.AdminAPIErr, err}
 	}
 
 	// TODO(chowski): remove this when us-central is removed.
@@ -244,30 +262,37 @@ func (s *RemoteCertSource) Remote(instance string) (cert *x509.Certificate, addr
 		data.Region = "us-central1"
 	}
 	if data.Region != region {
+		var termCode string
 		if region == "" {
+			termCode = termcode.InstanceWithoutRegion
 			err = fmt.Errorf("instance %v doesn't provide region", instance)
 		} else {
+			termCode = termcode.InstanceWithWrongRegion
 			err = fmt.Errorf(`for connection string "%s": got region %q, want %q`, instance, region, data.Region)
 		}
 		if s.checkRegion {
-			return nil, "", "", err
+			return nil, "", recutil.Unknown, "", termcode.Error{termCode, err}
 		}
 		logging.Errorf("%v", err)
 		logging.Errorf("WARNING: specifying the correct region in an instance string will become required in a future version!")
 	}
 
 	if len(data.IpAddresses) == 0 {
-		return nil, "", "", fmt.Errorf("no IP address found for %v", instance)
+		err := termcode.Error{termcode.InstanceWithoutIP, fmt.Errorf("no IP address found for %v", instance)}
+		return nil, "", recutil.Unknown, "", err
 	}
 
 	// Find the first matching IP address by user input IP address types
 	ipAddrInUse := ""
-	ipAddrInUse, err = s.findIPAddr(data, instance)
+	ipAddrInUse, ipType, err = s.findIPAddr(data, instance)
 	if err != nil {
-		return nil, "", "", err
+		err := termcode.Error{termcode.InstanceIPTypeMismatch, err}
+		return nil, "", ipType, "", err
 	}
 
 	c, err := parseCert(data.ServerCaCert.Cert)
-
-	return c, ipAddrInUse, p + ":" + n, err
+	if err != nil {
+		err = termcode.Error{termcode.InstanceCertParseErr, err}
+	}
+	return c, ipAddrInUse, ipType, p + ":" + n, err
 }

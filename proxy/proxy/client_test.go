@@ -15,6 +15,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -24,6 +25,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/termcode"
 )
 
 const instance = "instance-name"
@@ -39,7 +42,7 @@ type blockingCertSource struct {
 	values map[string]*fakeCerts
 }
 
-func (cs *blockingCertSource) Local(instance string) (tls.Certificate, error) {
+func (cs *blockingCertSource) Local(_ context.Context, instance string) (tls.Certificate, error) {
 	v, ok := cs.values[instance]
 	if !ok {
 		return tls.Certificate{}, fmt.Errorf("test setup failure: unknown instance %q", instance)
@@ -57,8 +60,8 @@ func (cs *blockingCertSource) Local(instance string) (tls.Certificate, error) {
 	}, nil
 }
 
-func (cs *blockingCertSource) Remote(instance string) (cert *x509.Certificate, addr, name string, err error) {
-	return &x509.Certificate{}, "fake address", "fake name", nil
+func (cs *blockingCertSource) Remote(_ context.Context, instance string) (cert *x509.Certificate, addr, ipType, name string, err error) {
+	return &x509.Certificate{}, "fake address", "fake IP type", "fake name", nil
 }
 
 func TestClientCache(t *testing.T) {
@@ -74,7 +77,7 @@ func TestClientCache(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		if _, err := c.Dial(instance); err != errFakeDial {
+		if _, err := c.Dial(instance); err.(termcode.Error).Err != errFakeDial {
 			t.Errorf("unexpected error: %v", err)
 		}
 	}
@@ -113,7 +116,7 @@ func TestConcurrentRefresh(t *testing.T) {
 	b.Unlock()
 
 	for i := 0; i < numDials; i++ {
-		if err := <-ch; err != errFakeDial {
+		if err := <-ch; err.(termcode.Error).Err != errFakeDial {
 			t.Errorf("unexpected error: %v", err)
 		}
 	}
@@ -125,6 +128,7 @@ func TestConcurrentRefresh(t *testing.T) {
 }
 
 func TestMaximumConnectionsCount(t *testing.T) {
+	ctx := context.Background()
 	const maxConnections = 10
 	const numConnections = maxConnections + 1
 	var dials uint64 = 0
@@ -166,7 +170,7 @@ func TestMaximumConnectionsCount(t *testing.T) {
 				Instance: instanceName,
 				Conn:     &dummyConn{},
 			}
-			c.handleConn(conn)
+			c.handleConn(ctx, conn)
 
 			firstDialOnce.Do(func() { close(firstDialExited) })
 		}(instanceName)

@@ -35,6 +35,7 @@ package fuse
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -42,13 +43,17 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/metrics"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/record"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/tag"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
-	"golang.org/x/net/context"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/recutil"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/termcode"
+	octag "go.opencensus.io/tag"
 )
 
 // Supported returns true if the current system supports FUSE.
@@ -163,13 +168,20 @@ var _ interface {
 	fs.HandleReadDirAller
 } = &fsRoot{}
 
-func (r *fsRoot) newConn(instance string, c net.Conn) {
+func (r *fsRoot) newConn(ctx context.Context, conn proxy.Conn) {
 	r.RLock()
 	// dst will be nil if Close has been called already.
 	if ch := r.dst; ch != nil {
-		ch <- proxy.Conn{instance, c}
+		ch <- conn
 	} else {
-		logging.Errorf("Ignored new conn request to %q: system has been closed", instance)
+		logging.Errorf("Ignored new conn request to %q: system has been closed", conn.Instance)
+		err := record.Increment(ctx, metrics.TermCodeCount,
+			octag.Tag{tag.TermCodeKey, termcode.FuseClose},
+			octag.Tag{tag.IPTypeKey, recutil.Unknown},
+		)
+		if err != nil {
+			logging.Errorf("%v", recutil.Err(conn.Instance, metrics.TermCodeCount, err))
+		}
 	}
 	r.RUnlock()
 }
@@ -232,7 +244,7 @@ func (r *fsRoot) Attr(ctx context.Context, a *fuse.Attr) error {
 // the README, it returns a node which is a symbolic link to a socket which
 // provides connectivity to a remote instance.  The instance which is connected
 // to is determined by req.Name.
-func (r *fsRoot) Lookup(_ context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
+func (r *fsRoot) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
 	if req.Name == "README" {
 		return readme{}, nil
 	}
@@ -255,7 +267,7 @@ func (r *fsRoot) Lookup(_ context.Context, req *fuse.LookupRequest, resp *fuse.L
 		logging.Errorf("couldn't update permissions for socket file %q: %v; other users may be unable to connect", path, err)
 	}
 
-	go r.listenerLifecycle(sock, instance, path)
+	go r.listenerLifecycle(ctx, sock, instance, path)
 
 	ret := symlink(path)
 	r.links[instance] = ret
@@ -280,23 +292,8 @@ func (r *fsRoot) removeListener(instance, path string) {
 
 // listenerLifecycle calls l.Accept in a loop, and for each new connection
 // r.newConn is called. After the Listener returns an error it is removed.
-func (r *fsRoot) listenerLifecycle(l net.Listener, instance, path string) {
-	for {
-		start := time.Now()
-		c, err := l.Accept()
-		if err != nil {
-			logging.Errorf("error in Accept for %q: %v", instance, err)
-			if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
-				d := 10*time.Millisecond - time.Since(start)
-				if d > 0 {
-					time.Sleep(d)
-				}
-				continue
-			}
-			break
-		}
-		r.newConn(instance, c)
-	}
+func (r *fsRoot) listenerLifecycle(ctx context.Context, l net.Listener, instance, path string) {
+	proxy.Listen(ctx, r.newConn, l, instance, path)
 	r.removeListener(instance, path)
 	l.Close()
 	if err := os.Remove(path); err != nil {

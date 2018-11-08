@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -32,17 +33,19 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/compute/metadata"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/clientcategory"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/monitoring/monitoring"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/certs"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/fuse"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/limits"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/recutil"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
-
-	"cloud.google.com/go/compute/metadata"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	goauth "golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 	sqladmin "google.golang.org/api/sqladmin/v1beta4"
 )
 
@@ -86,6 +89,9 @@ You may set the GOOGLE_APPLICATION_CREDENTIALS environment variable for the same
 
 	// Setting to choose what API to connect to
 	host = flag.String("host", "https://www.googleapis.com/sql/v1beta4/", "When set, the proxy uses this host as the base API path.")
+
+	monitorEnable      = flag.Bool("monitor_enable", false, "Enable stackdriver monitoring.")
+	monitorReportDelay = flag.Duration("monitor_report_delay", 0, "Delay between aggregated report of monitored metrics. When value less or equal to 0 is provided, monitoring's default value will be used.")
 )
 
 const (
@@ -192,15 +198,6 @@ Information for all flags:
 
 var defaultTmp = filepath.Join(os.TempDir(), "cloudsql-proxy-tmp")
 
-// See https://github.com/GoogleCloudPlatform/gcloud-golang/issues/194
-func onGCE() bool {
-	res, err := http.Get("http://metadata.google.internal")
-	if err != nil {
-		return false
-	}
-	return res.Header.Get("Metadata-Flavor") == "Google"
-}
-
 const defaultVersionString = "NO_VERSION_SET"
 
 var versionString = defaultVersionString
@@ -209,19 +206,29 @@ var versionString = defaultVersionString
 // identifying this proxy process, or a blank string if versionString was not
 // set to an interesting value.
 func userAgentFromVersionString() string {
-	if versionString == defaultVersionString {
+	shortVersion := shortVersionString()
+	if shortVersion == defaultVersionString {
 		return ""
+	}
+	return "cloud_sql_proxy " + shortVersion
+}
+
+// shortVersionString is the shortened version string. We return defaultVersionString if
+// versionString was not set to an interesting value.
+// Example versionString (see build.sh):
+//    version 1.05; sha 0f69d99588991aba0879df55f92562f7e79d7ca1 built Mon May  2 17:57:05 UTC 2016
+//
+// We just return the part before the semicolon.
+func shortVersionString() string {
+	if versionString == defaultVersionString {
+		return defaultVersionString
 	}
 
-	// Example versionString (see build.sh):
-	//    version 1.05; sha 0f69d99588991aba0879df55f92562f7e79d7ca1 built Mon May  2 17:57:05 UTC 2016
-	//
-	// We just want the part before the semicolon.
 	semi := strings.IndexByte(versionString, ';')
 	if semi == -1 {
-		return ""
+		return defaultVersionString
 	}
-	return "cloud_sql_proxy " + versionString[:semi]
+	return versionString[:semi]
 }
 
 const accountErrorSuffix = `Please create a new VM with Cloud SQL access (scope) enabled under "Identity and API access". Alternatively, create a new "service account key" and specify it using the -credential_file parameter`
@@ -354,6 +361,23 @@ func gcloudProject() ([]string, error) {
 	return []string{cfg.Configuration.Properties.Core.Project}, nil
 }
 
+// monitorInit initializes monitoring facility.
+func monitorInit(ctx context.Context, clientOpts []option.ClientOption) error {
+	opts := monitoring.Options{
+		ReportDelay:   *monitorReportDelay,
+		ClientOptions: clientOpts,
+	}
+	uuid, err := monitoring.Initialize(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("monitoring.Initialze() failed: %v", err)
+	}
+	// Set the version string that can be used throughout the monitoring.
+	recutil.Version = shortVersionString()
+
+	logging.Infof("Monitoring initialized. The unique identifier of cloudsql-proxy execution used by monitoring: %s\n", uuid)
+	return nil
+}
+
 // Main executes the main function of the proxy, allowing it to be called from tests.
 //
 // Setting timeout to a value greater than 0 causes the process to panic after
@@ -423,7 +447,7 @@ func main() {
 		}
 	}
 
-	onGCE := onGCE()
+	onGCE := clientcategory.OnGCE()
 	if err := checkFlags(onGCE); err != nil {
 		log.Fatal(err)
 	}
@@ -434,12 +458,20 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if *monitorEnable {
+		if err := monitorInit(ctx, nil); err != nil {
+			logging.Errorf("initializing monitoring service failed, and no monitoring will be performed: %v", err)
+		} else {
+			defer monitoring.Close()
+		}
+	}
+
 	ins, err := listInstances(ctx, client, projList)
 	if err != nil {
 		log.Fatal(err)
 	}
 	instList = append(instList, ins...)
-	cfgs, err := CreateInstanceConfigs(*dir, *useFuse, instList, *instanceSrc, client)
+	cfgs, err := CreateInstanceConfigs(ctx, *dir, *useFuse, instList, *instanceSrc, client)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -477,7 +509,7 @@ func main() {
 			}()
 		}
 
-		c, err := WatchInstances(*dir, cfgs, updates, client)
+		c, err := WatchInstances(ctx, *dir, cfgs, updates, client)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -501,5 +533,5 @@ func main() {
 		}),
 		Conns:              connset,
 		RefreshCfgThrottle: refreshCfgThrottle,
-	}).Run(connSrc)
+	}).Run(ctx, connSrc)
 }
